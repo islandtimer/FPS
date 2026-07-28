@@ -543,15 +543,18 @@ void main() {
   float vig = 1.0 - uVignette * smoothstep(0.12, 0.72, r2);
   c *= vig;
 
+  c = srgb(c);
+
 #ifdef USE_GRAIN
-  // Grain lives in the shadows, where a real sensor's noise floor is. Scaling it
-  // by darkness also hides the banding 8-bit output would otherwise show there.
+  // Grain goes on AFTER the transfer function. Added in linear it would be
+  // perceptually enormous in the shadows — the encode curve has a slope of ~12
+  // near black, so a 1% linear perturbation lands as a 13% display step.
+  // Weighted toward the darks, where a real sensor's noise floor lives.
   float g = hash12(gl_FragCoord.xy + uFrame * 17.371) - 0.5;
-  float shadowW = 1.0 - smoothstep(0.0, 0.55, luma(c));
-  c += g * uGrain * (0.25 + shadowW * 0.75);
+  float shadowW = 1.0 - smoothstep(0.0, 0.62, luma(c));
+  c += g * uGrain * (0.35 + shadowW * 0.65);
 #endif
 
-  c = srgb(c);
   // Triangular dither, one 8-bit LSB: removes gradient banding in the sky.
   float dth = (hash12(gl_FragCoord.xy + uFrame * 3.117) - hash12(gl_FragCoord.yx + 11.0 + uFrame * 3.117)) / 255.0;
   gl_FragColor = vec4(c + dth, 1.0);
@@ -755,7 +758,7 @@ export class RenderPipeline {
       uAoStrength: { value: 0.85 },
       uVignette: { value: 0.34 },
       uCA: { value: 0.0022 },
-      uGrain: { value: 0.028 },
+      uGrain: { value: 0.022 },
       uSharpen: { value: 0.38 },
       uFrame: { value: 0 },
       uLift: { value: new THREE.Vector3(0.006, 0.0085, 0.0135) },
