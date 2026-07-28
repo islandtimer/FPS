@@ -37,10 +37,15 @@
 //
 // THE SIGHT PICTURE IS SOLVED, NOT POSED. The optic sits high enough, and the
 // top of the handguard low enough, that the forward half of the rifle falls
-// OUTSIDE the cone the eye sees through the objective. `topOfForend()` computes
-// that clearance from the real aperture and the real eye position rather than
-// trusting eyeballed numbers to survive a change of optic. Nothing but sky and
-// target is inside the tube.
+// OUTSIDE the cone the eye sees through the objective. `clearTop()` computes
+// that clearance from the real aperture and the real eye position, and
+// `aperture()` closes the window down when a long barrel puts the muzzle device
+// somewhere no amount of clearance can fix, rather than trusting eyeballed
+// numbers to survive a change of optic. Nothing but sky and target is inside the
+// tube — and the second half of that rule is that nothing may sit INSIDE the
+// bore either, which is a separate and easier mistake to make: the bore runs
+// closer to the optical axis than the tube's outer skin does, so mount parts
+// sized off the outside diameter push up through the floor of the sight picture.
 //
 // NOTHING LIVES ON THE NEAR PLANE. At full ADS the eye sits at rifle-local
 // z = +0.113, so anything aft of z = +0.067 is closer to the camera than the

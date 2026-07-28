@@ -125,7 +125,12 @@ const GORE_LIT = 1.5;
 const FLASH_LIFE = 0.052;       // particle life (shader holds full to 0.72u = 37ms)
 const LIGHT_LIFE = 0.070;       // bounce light total
 const LIGHT_HOLD = 0.030;       // ...of which the tail; full above this
-const LIGHT_PEAK = 62.0;       // candela at the muzzle
+// 62cd at the muzzle sounds enormous next to a sun of 8, and it is: the gun is
+// black polymer at roughly 3% albedo, so even this only brings the handguard up
+// to about the brightness of a sunlit wall. Measured at the working exposure it
+// puts a warm gradient down the receiver, a pool on the ground two metres out,
+// and a readable kiss on cover at eight.
+const LIGHT_PEAK = 62.0;
 // Non-physical decay: one light is standing in for the flash AND its bounce, and
 // an inverse-square falloff that blows out the handguard leaves nothing on the
 // ground two metres away. 1.6 keeps both ends of that range on screen.
@@ -1084,7 +1089,11 @@ export class Combat {
     this._offKill = bus.on(EV.KILL, () => { this._killEcho++; });
     this._off = bus.on(EV.SHOT, (e) => this.onShot(e));
 
-    this.stats = { shots: 0, hits: 0, pens: 0, drawCalls: 5, particlesLive: 0 };
+    this.stats = {
+      shots: 0, hits: 0, pens: 0, incoming: 0,
+      drawCalls: 5,   // fxA, fxB, decals, tracers, shells — unchanged this round
+      particlesLive: 0,
+    };
     if (typeof window !== 'undefined') window.__combat = this;
   }
 
@@ -1574,7 +1583,7 @@ export class Combat {
 
     // 6. Smoke, so sustained fire builds a haze the flash then lights from inside.
     this.fxA.emit(x + dx * 0.1, y + dy * 0.1, z + dz * 0.1, dx * 1.4, dy * 1.4 + 0.32, dz * 1.4,
-      0.46, 0.43, 0.40, 0.05, 0.24, 0.38 + r() * 0.20, -0.5, 2.6, 0, r(), t);
+      0.46, 0.43, 0.40, 0.05, 0.21, 0.30 + r() * 0.16, -0.5, 2.6, 0, r(), t);
 
     this.flash.position.set(x, y, z);
     this._flashPeak = LIGHT_PEAK * scale;
@@ -1758,7 +1767,7 @@ export class Combat {
         0.10 * e, 0.34 * e, 0.24, 0.8, 3.0, 0, r(), t);
     } else {
       // dust / poof / splinter / glass all share the puff+debris shape
-      const puffs = 3;
+      const puffs = 2;
       const rise = S.fx === 'poof' ? -0.15 : -0.9;   // negative gravity = it lifts
       const spd = S.fx === 'poof' ? 0.7 : 1.5;
       for (let i = 0; i < puffs; i++) {
@@ -1771,7 +1780,7 @@ export class Combat {
         this.fxA.emit(px + nx * 0.03, py + ny * 0.03, pz + nz * 0.03,
           jx * spd * e, jy * spd * e, jz * spd * e,
           S.dust[0] * k, S.dust[1] * k, S.dust[2] * k,
-          0.09 + r() * 0.06, (0.40 + r() * 0.34) * e, 0.62 + r() * 0.5,
+          0.10 + r() * 0.07, (0.44 + r() * 0.34) * e, 0.45 + r() * 0.35,
           rise, 2.5, 0, r(), t);
       }
       // Spall: fragments of the surface, thrown off the ricochet vector and
@@ -1987,6 +1996,7 @@ export class Combat {
     this._lastEnemyShot = this.time;
     e._cbLast = this.time;
     this._hostileShots++;
+    this.stats.incoming++;
 
     const msg = this._enemyMsg;
     msg.point.set(mx, my, mz);
@@ -1994,12 +2004,14 @@ export class Combat {
     msg.distance = dist;
     bus.emit(EV_ENEMY_FIRE, msg);
 
-    // Every second incoming round is a visible tracer: enough for the player to
-    // read the line back to the shooter, not so many that the street is a laser
-    // show and nothing stands out.
-    const tracer = (this._hostileShots & 1) === 0 ? 3 : 0;
+    // Two incoming rounds in three carry a tracer — a higher fraction than the
+    // player's belt, deliberately. Outgoing tracers are a stylistic flourish;
+    // incoming ones are the only thing that tells the player which of the five
+    // silhouettes down the street is the one shooting at them.
+    const tracer = (this._hostileShots % 3) !== 0 ? 3 : 0;
     this._resolve(mx, my, mz, dx, dy, dz, HOSTILE_RANGE, HOSTILE, -0.9, 0, 0,
       tracer, mx, my, mz, HOSTILE_SPEED);
+    return true;
   }
 
   // ------------------------------------------------------------------ frame
