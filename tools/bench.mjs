@@ -156,11 +156,10 @@ async function main() {
     ? shotNames
     : await page.evaluate(() => Object.keys(window.__game.shots));
 
-  // One page load for the whole contact sheet, re-posing between frames. Reloading
-  // per shot meant paying procedural scene init eight times, and under SwiftShader
-  // that init blocks DOMContentLoaded past any sane navigation timeout.
-  await page.goto(url('w=1920&h=1080'), { waitUntil: 'commit' });
-  await waitReady();
+  // No navigation here on purpose. The page is already loaded at 1920x1080 from the
+  // SwiftShader probe, and re-posing via applyShot costs one scene init instead of
+  // eight. A navigation at this point stalls anyway: committing one needs a response
+  // from a renderer process that is busy emitting a frame every ~200ms.
 
   for (const name of names) {
    try {
