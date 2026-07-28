@@ -100,9 +100,9 @@ void main() {
   vec3 b = cross(n, t);
   mat3 tbn = mat3(t, b, n);
 
-  // Shrink the world radius on distant pixels: keeps the tap footprint from
-  // collapsing under a texel and turning into noise.
-  float radius = uRadius * clamp(6.0 / max(1.0, -p.z), 0.35, 1.0) * (1.0 + max(0.0, -p.z) * 0.05);
+  // Constant world-space radius: contact darkening is a physical near-field
+  // effect and must not change scale as the player walks toward a corner.
+  float radius = uRadius;
 
   float occ = 0.0;
   for (int i = 0; i < SAMPLES; i++) {

@@ -4,8 +4,11 @@
 // historical comparison on the progress page.
 
 export const CAMERA_SHOTS = {
+  // Camera forward for a YXZ euler is (-sin(yaw), sin(pitch), -cos(yaw)) — yaw 0
+  // looks down -Z. Poses are re-anchored once against the finished level and then
+  // frozen, so every round after that is a like-for-like comparison.
   establish: {
-    pos: [0, 0, 30], yaw: Math.PI, pitch: -0.04,
+    pos: [0, 0, 30], yaw: 0, pitch: -0.04,
     desc: 'Wide exterior. Judges: sky, sun, aerial perspective, silhouette, composition.',
   },
   street: {
@@ -38,7 +41,7 @@ export const CAMERA_SHOTS = {
     desc: 'Close surface read. Judges: texel density, normal detail, roughness variation, tiling artefacts.',
   },
   silhouette: {
-    pos: [0, 0, 18], yaw: Math.PI + 0.2, pitch: 0.06,
+    pos: [0, 0, 18], yaw: 0.2, pitch: 0.06,
     desc: 'Enemy against bright background. Judges: character readability, rim light, animation pose.',
     setup({ enemies, level }) {
       enemies.clear();
