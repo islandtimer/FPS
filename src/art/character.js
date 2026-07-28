@@ -149,7 +149,7 @@ const P = {
   helmet: [0.40, 0.44, 0.43],
   helmetTrim: [0.20, 0.21, 0.22],
   visor: [0.16, 0.19, 0.20],
-  skin: [2.05, 1.48, 1.02],
+  skin: [1.42, 1.06, 0.76],
   gaiter: [0.32, 0.35, 0.34],
   glove: [0.26, 0.27, 0.27],
   boot: [0.22, 0.23, 0.23],
@@ -465,9 +465,11 @@ function buildBody(variant, rig, batch) {
   onChest(0.130, 1.302, 0.158 * bulk, 0.050, 0.058, 0.046, P.webbing);
   onChest(-0.196 * bulk, 1.150, 0.010, 0.052, 0.104, 0.092, P.pouch);
   onChest(0.198 * bulk, 1.158, 0.000, 0.050, 0.100, 0.088, P.pouch);
-  // rear pack + dump pouch
-  onChest(0.000, 1.290, -0.196 * bulk, 0.240, 0.210, 0.088, P.pouch);
-  onChest(0.105, 1.075, -0.150 * bulk, 0.110, 0.100, 0.070, P.webbing);
+  // Rear pack + dump pouch. Both sit far enough forward to overlap the carrier
+  // shell: 15mm of clearance is invisible up close and reads as a detached
+  // floating box in the 25m silhouette, which is where it matters.
+  onChest(0.000, 1.290, -0.172 * bulk, 0.240, 0.210, 0.092, P.pouch);
+  onChest(0.105, 1.075, -0.136 * bulk, 0.110, 0.100, 0.074, P.webbing);
   // belt
   push(batch, loft([
     { y: 1.000, hw: 0.152, hd: 0.110, e: 3.6, yaw: yaw(0.22), cz: 0.006 },
@@ -655,7 +657,7 @@ function buildHeadgear(kind, batch) {
   for (const s of [-1, 1]) {
     // ear covers hang below the rim — the notch they cut in the outline is
     // what separates a helmet from a hood at distance
-    push(batch, box(0.028, 0.078, 0.090, { x: s * 0.118, y: 1.632, z: -0.014, rz: s * 0.10 }),
+    push(batch, box(0.070, 0.080, 0.092, { x: s * 0.096, y: 1.630, z: -0.014 }),
       P.helmetTrim, HB);
     push(batch, box(0.013, 0.019, 0.108, { x: s * 0.120, y: 1.702, z: 0.008, rz: s * 0.26 }),
       P.helmetTrim, HB);
@@ -727,7 +729,9 @@ function buildGun(rig, batch) {
     0.030, 0.027, 8, 1, 3.4, true, true)), P.steel, W);
   push(batch, gbox(0.024, 0.012, hgB - hgA - 0.02, { z: (hgA + hgB) / 2, y: 0.036 }), P.steel, W);
   // barrel + muzzle device
-  push(batch, gtube(hgB, 0.002, L - 0.030, 0.002, 0.011, 0.010, 6), P.steel, W);
+  const brR = isDmr ? 0.015 : 0.012;
+  push(batch, gtube(hgB, 0.002, L - 0.030, 0.002, brR, brR - 0.001, 6), P.steel, W);
+  if (isDmr) push(batch, gtube(hgB + 0.060, 0.002, hgB + 0.092, 0.002, 0.022, 0.022, 6), P.steel, W);
   push(batch, gtube(L - 0.030, 0.002, L, 0.002, isShotgun ? 0.023 : 0.018, 0.017, 8), P.steel, W);
   // optic
   if (isDmr) {
@@ -991,7 +995,7 @@ class Character {
 
   setPose(s) {
     if (!s) return;
-    if (s.move != null) { this._t.move = Math.min(1, Math.max(0, s.move)); this._explicit = 1; }
+    if (s.move != null) { this._t.move = Math.min(1, Math.max(0, s.move)); this._explicit |= 1; }
     if (s.aim != null) { this._t.aim = Math.min(1, Math.max(0, s.aim)); this._explicit |= 2; }
     if (s.crouch != null) this._t.crouch = Math.min(1, Math.max(0, s.crouch));
     if (s.dead != null) {
@@ -1061,10 +1065,10 @@ class Character {
     const crouchDrop = 0.40 * crouch;
     const idle = Math.sin(this._clock * 1.35 + this._idleBias);
     const root = bones[B.root];
-    root.position.y = -(crouchDrop + bob) * alive + 0.30 * dead;
+    root.position.y = -(crouchDrop + bob) * alive + 0.378 * dead;
     root.position.z = -0.10 * dead;
     if (dead > 0.001) {
-      _e0.set(-1.34 * dead, this._fallYaw * dead, 0.22 * dead, 'YXZ');
+      _e0.set(-1.50 * dead, this._fallYaw * dead, 0.20 * dead, 'YXZ');
       root.quaternion.setFromEuler(_e0);
     }
 
@@ -1072,21 +1076,21 @@ class Character {
     const lean = (0.055 + 0.19 * move) * alive + 0.34 * crouch * alive;
     const hips = bones[B.hips];
     _e0.set(
-      (-0.05 * crouch) * alive + 0.26 * dead,
+      (-0.05 * crouch) * alive - 0.04 * dead,
       (0.17 * sp * mb + 0.02 * idle) * alive,
       (0.055 * sp * mb) * alive,
       'YXZ');
     hips.quaternion.setFromEuler(_e0);
 
     _e0.set(
-      lean * 0.55 + 0.30 * dead + 0.010 * idle * (1 - move),
+      lean * 0.55 + 0.12 * dead + 0.010 * idle * (1 - move),
       -0.07 * sp * mb * alive,
       -0.030 * sp * mb * alive,
       'YXZ');
     bones[B.spine].quaternion.setFromEuler(_e0);
 
     _e0.set(
-      lean * 0.45 + 0.20 * dead - 0.010 * idle * (1 - move),
+      lean * 0.45 + 0.10 * dead - 0.010 * idle * (1 - move),
       -0.09 * sp * mb * alive,
       0.020 * sp * mb * alive,
       'YXZ');
@@ -1095,13 +1099,13 @@ class Character {
     // Head counter-rotates the torso so the eyeline stays level while walking,
     // then drops to the stock as the rifle comes up.
     _e0.set(
-      (-lean * 0.62 + 0.11 * aim) * alive + 0.34 * dead,
+      (-lean * 0.62 + 0.11 * aim) * alive + 0.30 * dead,
       (0.09 * sp * mb + 0.055 * aim) * alive,
       (0.085 * aim - 0.030 * sp * mb) * alive,
       'YXZ');
     bones[B.neck].quaternion.setFromEuler(_e0);
     _e0.set(
-      (-lean * 0.30 + 0.06 * aim) * alive + 0.18 * dead,
+      (-lean * 0.30 + 0.06 * aim) * alive + 0.16 * dead,
       (-0.075 * aim) * alive,
       (0.075 * aim) * alive,
       'YXZ');
@@ -1226,8 +1230,10 @@ class Character {
 
     this._target.copy(target);
     if (dead > 0.001) {
-      // knees buckle and the feet slide in as the body goes down
-      _v1.copy(_v0); _v1.y -= 0.30; _v1.z += left ? 0.30 : 0.20;
+      // Knees buckle. The targets sit just BEHIND the hip in character space
+      // because the root tips backward through 86 degrees, which maps local
+      // -Z onto world +Y — aim the feet forward and they end up in the air.
+      _v1.copy(_v0); _v1.y -= 0.32; _v1.z -= left ? 0.05 : 0.02;
       this._target.lerp(_v1, dead);
     }
 

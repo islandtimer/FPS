@@ -87,8 +87,8 @@ const CRACK_RADIUS = 3.2;       // how close a round passes before it whips
 // a sunlit diffuse surface lands near 1.1 scene-linear, so dust at ~2.0 reads as
 // genuinely pulverised material catching the key light, and debris at ~1.4 reads
 // as a fragment of the surface it came off.
-const DUST_LIT = 3.0;
-const CHIP_LIT = 2.3;
+const DUST_LIT = 2.05;
+const CHIP_LIT = 1.7;
 const GORE_LIT = 1.5;
 
 // --- muzzle flash ----------------------------------------------------------
@@ -100,7 +100,7 @@ const GORE_LIT = 1.5;
 const FLASH_LIFE = 0.048;       // particle life (shader holds full to 0.72u)
 const LIGHT_LIFE = 0.070;       // bounce light total
 const LIGHT_HOLD = 0.030;       // ...of which the tail; full above this
-const LIGHT_PEAK = 13.0;        // candela at the muzzle; ~7x sun on the handguard
+const LIGHT_PEAK = 62.0;       // candela at the muzzle
 // Non-physical decay: one light is standing in for the flash AND its bounce, and
 // an inverse-square falloff that blows out the handguard leaves nothing on the
 // ground two metres away. 1.6 keeps both ends of that range on screen.
@@ -421,7 +421,7 @@ void main() {
   if (isStreak) vA *= 0.55 + 0.45 * sin(t * 96.0 + aCtl.w * 40.0);
   // Distance: unlit particles carry no aerial perspective, so thin them with
   // range. Flashes are exempt — a shooter 40m away must still be locatable.
-  if (!isFlash) vA *= 1.0 - 0.38 * smoothstep(14.0, 80.0, -mv.z);
+  if (!isFlash) vA *= 1.0 - 0.50 * smoothstep(10.0, 70.0, -mv.z);
   vA *= 1.0 - smoothstep(55.0, 130.0, -mv.z);
 }
 `;
@@ -448,7 +448,7 @@ void main() {
                      + 0.11 * sin(ang * 7.0 - vSeed * 11.3);
     a = smoothstep(1.0, 0.05, d / lump);
     // dust you can see through: a fully opaque puff reads as a paper cut-out
-    a *= a * 0.70;
+    a *= a * 0.40;
   } else if (vShape < 1.5) {
     float core = smoothstep(0.5, 0.0, abs(q.y) * 2.0);
     a = core * smoothstep(0.5, 0.12, abs(q.x));
@@ -466,10 +466,15 @@ void main() {
       + 0.150 * abs(sin(ang * petals * 0.5 + vSeed * 6.2831))
       + 0.055 * sin(ang * (petals + 3.0) - vSeed * 12.9)
       + 0.030 * sin(ang * 2.0 + vSeed * 3.7);
-    float star = smoothstep(lobe, 0.0, r);
-    float core = smoothstep(0.17, 0.02, r);
-    a = clamp(star * star + core, 0.0, 1.0);
-    b = 1.0 + core * 3.2 + star * 0.6;
+    // Gaussian in units of the lobe radius, not a hard smoothstep to the lobe
+    // edge: with a hard edge the whole petal sits above the filmic shoulder and
+    // clips to one flat white blob with no shape in it at all. The long tail is
+    // what leaves a gradient outside the clipped core for the eye to read.
+    float k = r / max(lobe, 0.02);
+    float star = exp(-2.0 * k * k);
+    float core = smoothstep(0.15, 0.02, r);
+    a = clamp(star + core, 0.0, 1.0);
+    b = 1.0 + core * 3.0 + star * 0.8;
   } else if (vShape < 4.5) {
     // Flash cone: fat at the muzzle end, drawn to a point downrange, with the
     // gas front torn rather than smooth.
@@ -489,7 +494,7 @@ void main() {
     // Heat haze off a hot barrel — low contrast, banded, never a solid shape.
     float d = length(vec2(q.x * 1.9, q.y)) * 2.0;
     float band = 0.55 + 0.45 * sin(q.y * 21.0 + vSeed * 18.0 + q.x * 7.0);
-    a = smoothstep(1.0, 0.10, d) * band * 0.17;
+    a = smoothstep(1.0, 0.10, d) * band * 0.11;
   }
   if (a <= 0.001 || vA <= 0.001) discard;
   gl_FragColor = vec4(vCol * b, a * vA);
@@ -1477,10 +1482,20 @@ export class Combat {
 
   /**
    * First-person muzzle flash. Six additive quads and one light, all of which
-   * exist from startup. The brightness numbers look absurd written down — a
-   * white core at 62 scene-linear against a sunlit wall at ~1.1 — and they are
-   * meant to: the filmic shoulder is an exponential asymptote, so anything under
-   * about 4.0 lands short of 250/255 and the frame still has no true white in it.
+   * exist from startup.
+   *
+   * Sizes are small because the muzzle is small ON SCREEN, not in the world: it
+   * sits 0.77m from the eye, where the 80-degree frustum is only 1.30m tall, so
+   * a 0.4m quad is a third of the picture. The old flash was 0.40 wide and got
+   * away with it only because its alpha had already decayed to 13% by the time
+   * anything was rendered. At full output that same quad whites out half the
+   * frame and the bloom pyramid does the other half.
+   *
+   * Brightness is the opposite story. The filmic shoulder is an exponential
+   * asymptote, so the difference between 4.0 and 100.0 scene-linear is four
+   * display levels — but below about 3.0 nothing in the frame ever reaches 250
+   * and the whole complaint stands. Small and violently overexposed is the shape
+   * of a real muzzle flash on a 60Hz sensor.
    */
   _muzzleFlash(x, y, z, dx, dy, dz, cfg) {
     const r = this._rng, t = this.time;
@@ -1490,23 +1505,29 @@ export class Combat {
     // 1. The core. This is the pixel that clips, and it is the only thing in the
     //    build that reaches display white on its own.
     this.fxB.emit(x + dx * 0.02, y + dy * 0.02, z + dz * 0.02, 0, 0, 0,
-      62.0, 47.0, 34.0, 0.085 * scale, 0.105 * scale, L, 0, 6, 5, r(), t);
+      30.0, 23.0, 16.0, 0.040 * scale, 0.054 * scale, L, 0, 6, 5, r(), t);
 
     // 2. Two star petals at different rolls and sizes. Unequal spokes: a
-    //    symmetric star reads as a sticker.
+    //    symmetric star reads as a sticker. Dim enough that only the inner half
+    //    of each petal clips and the outer half stays orange.
     this.fxB.emit(x, y, z, 0, 0, 0,
-      22.0, 11.0, 3.4, 0.40 * scale, 0.46 * scale, L, 0, 6, 3, r(), t);
+      4.6, 2.05, 0.60, 0.140 * scale, 0.172 * scale, L, 0, 6, 3, r(), t);
     this.fxB.emit(x + dx * 0.03, y + dy * 0.03, z + dz * 0.03, 0, 0, 0,
-      13.0, 6.0, 1.7, 0.66 * scale, 0.74 * scale, L, 0, 6, 3, r(), t);
+      1.90, 0.78, 0.20, 0.245 * scale, 0.290 * scale, L, 0, 6, 3, r(), t);
 
     // 3. The gas cone down the bore. aVel carries the bore so the vertex shader
-    //    can lay the quad along it in screen space.
+    //    can lay the quad along it in screen space. Firing away from the camera
+    //    there is no screen direction to lay it along and it falls back to a
+    //    radial burst, which is correct: you do not see a cone down your own bore.
     this.fxB.emit(x + dx * 0.03, y + dy * 0.03, z + dz * 0.03, dx, dy, dz,
-      16.0, 7.4, 2.1, 0.30 * scale, 0.34 * scale, L, 0, 6, 4, 0.3 + r() * 0.7, t);
+      3.4, 1.55, 0.44, 0.110 * scale, 0.132 * scale, L, 0, 6, 4, 0.3 + r() * 0.7, t);
 
-    // 4. A warm halo the bloom pyramid can grab, wider and much dimmer.
+    // 4. A weak wide glow — the light thrown onto the air, not the flash. Uses
+    //    the soft-puff profile rather than the hot-core one so it stays a
+    //    gradient instead of clipping into a second white disc, and it is kept
+    //    small because the bloom pyramid already supplies most of the halo.
     this.fxB.emit(x, y, z, 0, 0, 0,
-      3.4, 1.75, 0.62, 1.15 * scale, 1.30 * scale, L * 1.25, 0, 6, 5, r(), t);
+      0.62, 0.30, 0.11, 0.26 * scale, 0.33 * scale, L * 1.25, 0, 6, 0, r(), t);
 
     // 5. Unburnt powder thrown clear of the muzzle. Long enough to survive the
     //    flash itself, so the frame after the flash still has something in it.
@@ -1519,8 +1540,8 @@ export class Combat {
     }
 
     // 6. Smoke, so sustained fire builds a haze the flash then lights from inside.
-    this.fxA.emit(x + dx * 0.1, y + dy * 0.1, z + dz * 0.1, dx * 1.6, dy * 1.6 + 0.35, dz * 1.6,
-      0.62, 0.58, 0.54, 0.07, 0.40, 0.42 + r() * 0.22, -0.5, 2.6, 0, r(), t);
+    this.fxA.emit(x + dx * 0.1, y + dy * 0.1, z + dz * 0.1, dx * 1.4, dy * 1.4 + 0.32, dz * 1.4,
+      0.46, 0.43, 0.40, 0.05, 0.24, 0.38 + r() * 0.20, -0.5, 2.6, 0, r(), t);
 
     this.flash.position.set(x, y, z);
     this._flashPeak = LIGHT_PEAK * scale;
@@ -1541,14 +1562,14 @@ export class Combat {
     const r = this._hrng, t = this.time;
     const L = FLASH_LIFE * 1.35;   // slightly longer: fewer pixels to be seen in
     this.fxB.emit(x, y, z, 0, 0, 0,
-      44.0, 30.0, 17.0, 0.15, 0.19, L, 0, 6, 5, r(), t);
+      36.0, 25.0, 14.0, 0.13, 0.17, L, 0, 6, 5, r(), t);
     this.fxB.emit(x, y, z, 0, 0, 0,
-      15.0, 7.6, 2.4, 0.52, 0.60, L, 0, 6, 3, r(), t);
+      7.0, 3.2, 0.95, 0.46, 0.54, L, 0, 6, 3, r(), t);
     this.fxB.emit(x + dx * 0.05, y + dy * 0.05, z + dz * 0.05, dx, dy, dz,
-      9.0, 4.2, 1.2, 0.26, 0.30, L, 0, 6, 4, 0.3 + r() * 0.7, t);
+      4.4, 2.0, 0.58, 0.24, 0.28, L, 0, 6, 4, 0.3 + r() * 0.7, t);
     // halo: this is what actually makes it findable across the street
     this.fxB.emit(x, y, z, 0, 0, 0,
-      2.6, 1.35, 0.48, 1.05, 1.20, L * 1.3, 0, 6, 5, r(), t);
+      1.5, 0.78, 0.28, 0.95, 1.10, L * 1.3, 0, 6, 0, r(), t);
     this.fxA.emit(x + dx * 0.12, y + dy * 0.12, z + dz * 0.12, dx * 1.1, 0.5, dz * 1.1,
       0.55, 0.52, 0.48, 0.06, 0.42, 0.55, -0.35, 2.4, 0, r(), t);
   }
@@ -1617,6 +1638,14 @@ export class Combat {
     }
   }
 
+  /** Distance from the eye, for FX that have to hold a screen size, not a world one. */
+  _camDist(x, y, z) {
+    const p = this.world && this.world.player && this.world.player.pos;
+    if (!p) return 12;
+    const dx = x - p.x, dy = y - (p.y + 1.68), dz = z - p.z;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
   /** Per-surface impact burst. Everything comes out of the two shared fields. */
   _impact(surface, px, py, pz, nx, ny, nz, dx, dy, dz, energy) {
     const S = SURF[surface] || SURF.concrete;
@@ -1631,11 +1660,17 @@ export class Combat {
     // same hold-then-cliff curve as the muzzle flash. This is the thing that
     // says "a round landed HERE" in the two frames before the dust has grown,
     // and it is what was missing from every frame in the last set.
+    //
+    // It is sized in SCREEN terms, not world terms: a 10cm flare is a legible
+    // strike at 4m and a single pixel at 35m, and an impact you cannot see is
+    // the whole complaint. Growing it with range keeps it about a constant
+    // fraction of frame height wherever the round lands.
     if (S.fx !== 'blood') {
-      const fk = S.fx === 'spark' ? 1.5 : S.fx === 'poof' ? 0.55 : 0.85;
+      const fk = S.fx === 'spark' ? 1.5 : S.fx === 'poof' ? 0.6 : 0.9;
+      const sz = (0.075 + 0.0105 * Math.min(46, this._camDist(px, py, pz))) * e;
       this.fxB.emit(px + nx * 0.02, py + ny * 0.02, pz + nz * 0.02, 0, 0, 0,
-        S.dust[0] * 11.0 * fk, S.dust[1] * 9.0 * fk, S.dust[2] * 6.4 * fk,
-        0.075 * e, 0.10 * e, FLASH_LIFE, 0, 6, 5, r(), t);
+        S.dust[0] * 9.5 * fk, S.dust[1] * 7.8 * fk, S.dust[2] * 5.6 * fk,
+        sz, sz * 1.3, FLASH_LIFE, 0, 6, 5, r(), t);
     }
 
     if (S.fx === 'spark') {
@@ -1668,7 +1703,7 @@ export class Combat {
         0.10 * e, 0.34 * e, 0.24, 0.8, 3.0, 0, r(), t);
     } else {
       // dust / poof / splinter / glass all share the puff+debris shape
-      const puffs = S.fx === 'poof' ? 4 : 5;
+      const puffs = 3;
       const rise = S.fx === 'poof' ? -0.15 : -0.9;   // negative gravity = it lifts
       const spd = S.fx === 'poof' ? 0.7 : 1.5;
       for (let i = 0; i < puffs; i++) {
@@ -1686,7 +1721,7 @@ export class Combat {
       }
       // Spall: fragments of the surface, thrown off the ricochet vector and
       // tumbling. These are what tell you the wall lost material.
-      const chips = ((S.chips + 2) * e) | 0;
+      const chips = (S.chips * e) | 0;
       for (let i = 0; i < chips; i++) {
         const sp = 2.6 + r() * 7.5 * e;
         const jx = rxv + (r() - 0.5) * 1.5, jy = ryv + (r() - 0.5) * 1.5 + 0.35, jz = rzv + (r() - 0.5) * 1.5;
@@ -1701,7 +1736,7 @@ export class Combat {
       // A few grains catch the key light on the way out — the glint that stops
       // spall reading as flat grey confetti.
       if (S.fx !== 'poof') {
-        const g = (2 * e) | 0;
+        const g = e > 0.9 ? 2 : 1;
         for (let i = 0; i < g; i++) {
           const sp = 3.0 + r() * 7.0 * e;
           const jx = rxv + (r() - 0.5) * 1.7, jy = ryv + (r() - 0.5) * 1.7 + 0.5, jz = rzv + (r() - 0.5) * 1.7;

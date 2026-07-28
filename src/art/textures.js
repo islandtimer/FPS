@@ -22,8 +22,10 @@
 //      internal repeat of the pattern never lines up with itself inside the tile;
 //   2. domain warping (which preserves the period, since the warp field is itself
 //      periodic) destroys the axis-aligned feel of the lattice;
-//   3. materials.js layers a low-frequency macro-variation map at 1/8 the tile
-//      frequency over the top, which breaks the repeat ACROSS tiles.
+//   3. materials.js layers a low-frequency macro-variation map at 1/4.31 the
+//      tile frequency over the top — an 8.6 m field on a 2 m tile, carrying
+//      independent value and hue axes — which breaks the repeat ACROSS tiles
+//      and supplies the 4-8 m band no tile can hold.
 //
 // Output is read back to DataTextures rather than kept as render-target textures:
 // that makes them cheap to clone for different repeat values (clones share the
@@ -264,8 +266,8 @@ void main() {
   vec2 wq = dwarp(uv, vec2(3.0), 0.05, S + 3u);
 
   // (a) MACRO TONE. 25 cm - 1 m patchiness: skim coats, old repairs, sun
-  //     bleaching. materials.js lays a second ~6.7 m field over the top of this,
-  //     so together they cover the whole 0.25-7 m band. Without both, a 6 m wall
+  //     bleaching. materials.js lays a second ~8.6 m field over the top of this,
+  //     so together they cover the whole 0.25-9 m band. Without both, a 6 m wall
   //     is one flat beige at 40 m no matter how good the 5 cm detail is.
   // contrast-stretched: raw fbm clusters hard around 0.5, so feeding it
   // straight into a colour ramp uses about a third of the range asked for and
@@ -297,8 +299,8 @@ void main() {
   // like — enough to break the surface, not enough to become the surface.
   float spallF = fbm01(dwarp(uv, vec2(7.0), 0.07, S + 21u), vec2(9.0), 3, 0.50, S + 22u)
                + crack * 0.030;
-  float spall  = smoothstep(0.664, 0.680, spallF);
-  float lip    = smoothstep(0.634, 0.662, spallF) * (1.0 - smoothstep(0.662, 0.676, spallF));
+  float spall  = smoothstep(0.666, 0.692, spallF);
+  float lip    = smoothstep(0.640, 0.664, spallF) * (1.0 - smoothstep(0.664, 0.684, spallF));
   // the substrate has its own, much coarser grain — 2 cm aggregate, carried in
   // the height so the normal map and the albedo speckle agree about where it is.
   // Kept shallow: a deep grit field drives the baked AO to its floor across the
@@ -322,8 +324,8 @@ void main() {
           + roll * 0.024              // 2.1 mm trowel undulation
           + stipple * 0.010           // 0.9 mm stipple
           - crack * 0.016             // 1.4 mm hairline, not a 26 mm trench
-          - spall * 0.038             // 3.3 mm of finish coat gone
-          + lip * 0.019               // the broken edge stands proud
+          - spall * 0.031             // 2.7 mm of finish coat gone
+          + lip * 0.012               // the broken edge stands proud
           + spall * grit * 0.0065     // exposed aggregate inside the patch
           + (macro - 0.5) * 0.010;
   F = vec4(h, spall, clamp(crack * 0.80 + run * 1.00 + dirt * 0.45, 0.0, 1.0), macro);
@@ -343,7 +345,11 @@ void main() {
   vec3  peb    = worley(uv, vec2(64.0), 1.0, S + 7u);
   float pebble = smoothstep(0.24, 0.11, peb.x) * step(0.84, peb.z);
   float grain  = fbm(uv, vec2(110.0), 2, 0.5, S + 8u);
-  float h = 0.5 + dune * 0.085 + ripple * 0.036 + pebble * 0.028 + grain * 0.008;
+  // Ripple relief is deliberately smaller than the dune term. A 3 m tile of
+  // ground repeats fourteen times across the plaza, and the higher the ripple
+  // train stands the more the eye locks onto that repeat as corduroy; the
+  // metre-scale drift is what has to carry the ground.
+  float h = 0.5 + dune * 0.100 + ripple * 0.029 + pebble * 0.028 + grain * 0.008;
   F = vec4(h, pebble, grain * 0.5 + 0.5, dune * 0.5 + 0.5);
 
 #elif MAT == 3
@@ -715,9 +721,17 @@ void main() {
   // the local coat instead, it is guaranteed +12% value and desaturated toward
   // grey everywhere. dn is the same fine relief the normal map carries, so the
   // grain you can see in the colour is the grain you can feel in the light.
+  // It reads as EXPOSED SUBSTRATE because it is coarse, matte and slightly
+  // greyer — NOT because it is bright. The value step is deliberately tiny, 4.5%,
+  // and that number is the whole fix for this surface: at +11% the patches
+  // multiplied through the level's warm tint and the macro brighten-side and
+  // clipped to white, so a 60 cm spall read as a white blob stuck on the wall.
+  // That is precisely the "unmapped placeholder decal" the frames were showing.
+  // Contrast now comes from dn (coarse grain, three times the coat's), from
+  // roughness (0.95 against 0.885) and from the lip's own occlusion.
   float coatY = dot(coat, vec3(0.30, 0.59, 0.11));
-  vec3 base = mix(coat, vec3(coatY), 0.45) * 1.085 + 0.018;
-  base *= 1.0 + dn * 0.34;                 // coarse aggregate, three times the coat's
+  vec3 base = mix(coat, vec3(coatY), 0.38) * 1.045;
+  base *= 1.0 + dn * 0.44;
   alb = mix(coat, base, sub);
   alb *= 1.0 + dn * 0.06;
   // The stain in the MAP stays fairly light. Heavy darkening is left to the

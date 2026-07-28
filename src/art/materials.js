@@ -253,7 +253,7 @@ if ( uGrime.w > 0.0 || uStreak.x > 0.0 ) {
   // rather than fighting it, and gated regionally so some walls are clean.
   vec2 gsUv = vec2( gWorld.x * 0.116 - gWorld.z * 0.071 + 0.37, gWorld.y * 0.031 );
   gStreak = uStreak.x * gFace
-          * smoothstep( 0.54, 0.88, texture2D( uMacroMap, gsUv ).b )
+          * smoothstep( 0.44, 0.86, texture2D( uMacroMap, gsUv ).b )
           * smoothstep( 0.30, 1.60, gWorld.y )
           * ( 0.30 + 0.90 * smoothstep( 0.25, 0.75, gMacro.a ) );
 }

@@ -5,8 +5,10 @@
 //   new ViewModel(camera, weapon, player)
 //   .update(dt) -> void
 //   .triggerDown(bool), .reload(), .setAds(bool), .switchFire()
+//   .forceShot() -> bool          (screenshot harness: fire one round NOW)
 //   .state -> { ammo, reserve, reloading, ads, adsT, firing, fireMode }
 // Emits: EV.SHOT {origin,dir,spread,weapon}, EV.RELOAD, EV.WEAPON_STATE
+// Writes: camera.fov (ADS compression — see ADS below). Restored on dispose().
 //
 // ---------------------------------------------------------------------------
 // HOW THIS IS BUILT, and why.
@@ -34,6 +36,29 @@
 // rest position is not a hand-tuned constant — it is solved at construction from
 // the optic's actual transform, so the reticle centres itself if the art moves.
 //
+// REST POSE. The rig sits about 11cm from the eye at the rear of the receiver
+// and 71cm at the muzzle, which is close enough that the near end is cropped by
+// the right and bottom edges of frame and its 0.5mm chamfers are two pixels
+// wide. That crop is the point: a viewmodel that fits entirely inside the frame
+// reads as a prop on a table, because nothing in the shot is nearer than arm's
+// length. Three angles do the rest of the work — 4.9 degrees of muzzle rise,
+// 4.3 degrees of inward yaw and 8.9 degrees of cant on top of the 2 degrees the
+// art bakes in — so the receiver presents its top deck and right flank at once
+// instead of the head-on sliver you get from a rig parallel to the view axis.
+// Because the body is now ~1.9x nearer than it was, every positional offset in
+// the module subtends ~1.9x the screen angle it was tuned at; NEAR_COMP scales
+// the whole offset sum back so sway, bob, lag and kick keep their tuned angular
+// amplitude rather than doubling.
+//
+// ADS is a fast eased transition plus real FOV compression, not a lerp. The
+// blend parameter is integrated with a rate that is a power of the remaining
+// distance, so it leaves the rest pose at full speed and decelerates into the
+// sight — the same curve as 1-(1-t)^2.6 but as an ODE, which means reversing
+// mid-transition is continuous instead of snapping between two curves. On top of
+// that, the camera's vertical FOV compresses by ADS_ZOOM. Sliding a gun forward
+// magnifies nothing; the reason a real sight picture reads as aiming is that the
+// world got bigger.
+//
 // RECOIL is two systems. The viewmodel kick is large, fast and fully recovers.
 // The camera displacement is smaller, recovers slowly, and only ~65% of it comes
 // back — the residue is the climb the player has to pull down. The per-shot
@@ -51,6 +76,27 @@ const _tmp = new THREE.Vector3();
 const SUB = 1 / 240;          // spring integration step
 const MAX_SUB = 16;           // dt is clamped to 50ms upstream; this is headroom
 const TAU = Math.PI * 2;
+const DEG = Math.PI / 180;
+
+// Hip rest pose. Solved against the real part positions in art/weapon.js so the
+// magwell lands mid lower-right quadrant, the ejection port sits at (0.53,-0.55)
+// in NDC and the rear of the receiver leaves frame past the right edge.
+const HIP_POS = [0.176, -0.115, -0.178];
+const HIP_RX = 0.085;   // muzzle up
+const HIP_RY = 0.075;   // muzzle inboard, toward the centre line
+const HIP_RZ = 0.155;   // cant: top deck rolled toward the middle of frame
+// Positional offsets were tuned when the body sat ~1.9x further from the eye.
+const NEAR_COMP = 0.68;
+// Linear magnification at full ADS. The base frustum is 80 degrees vertical,
+// which is very wide, so a red dot has to take a real bite out of it to read as
+// aimed at all.
+const ADS_ZOOM = 1.50;
+// The ADS blend leaves rest at full speed and decelerates in (see header).
+const ADS_IN_P = 2.6;
+const ADS_OUT_P = 1.8;
+// A dry magazine rolls into a reload after this long — enough for the last
+// flash and the bolt locking back to be seen, short enough to feel automatic.
+const AUTO_RELOAD_DELAY = 0.14;
 
 // Spring slots. One flat bank, indices instead of objects, so `step()` is a
 // single loop with no property lookups per element.
@@ -183,6 +229,15 @@ export class ViewModel {
     this._boltCycle = 1;      // 0..1, 1 = at rest
     this._trigPull = 0;
     this._muzzleFlash = 0;
+    this._autoReload = -1;    // <0 = disarmed, else seconds until the dry reload
+
+    // ------------------------------------------------------------ optics
+    // The camera is not ours, so its rest FOV is read once and always restored.
+    this._fovBase = camera.isPerspectiveCamera ? camera.fov : 0;
+    this._fovAds = this._fovBase > 0
+      ? 2 * Math.atan(Math.tan(this._fovBase * 0.5 * DEG) / ADS_ZOOM) / DEG
+      : 0;
+    this._fovWritten = this._fovBase;
 
     // ------------------------------------------------------------ reload
     this._reloadT = 0;
@@ -237,7 +292,7 @@ export class ViewModel {
       this._opticLocal.setFromMatrixPosition(optic.matrixWorld).applyMatrix4(inv);
     }
     const ADS_EYE = 0.142;   // optic tube centre to eye; front lens lands ~0.18m
-    this._hipBase = new THREE.Vector3(0.128, -0.112, -0.232);
+    this._hipBase = new THREE.Vector3(HIP_POS[0], HIP_POS[1], HIP_POS[2]);
     this._adsBase = new THREE.Vector3(
       -this._opticLocal.x, -this._opticLocal.y, -ADS_EYE - this._opticLocal.z,
     );
@@ -324,6 +379,12 @@ export class ViewModel {
     for (const off of this._offs) off();
     this._offs.length = 0;
     if (this.rig.parent) this.rig.parent.remove(this.rig);
+    // The camera is borrowed, not owned: give its frustum back exactly as found.
+    if (this._fovBase > 0 && this.camera.isPerspectiveCamera) {
+      this.camera.fov = this._fovBase;
+      this.camera.updateProjectionMatrix();
+      this._fovWritten = this._fovBase;
+    }
   }
 
   // ------------------------------------------------------------------ update
@@ -374,14 +435,42 @@ export class ViewModel {
     }
     const adsAllowed = !sprinting;
     const adsGoal = this.ads && adsAllowed ? 1 : 0;
-    const adsRate = dt / Math.max(0.05, cfg.adsTime * (adsGoal ? 0.88 : 0.80));
-    this._adsRaw = clamp(this._adsRaw + (adsGoal ? adsRate : -adsRate), 0, 1);
-    this.adsT = smoother(this._adsRaw);
+    // Eased as an ODE, not as a curve stretched over a linear ramp: the rate is a
+    // power of the distance left to travel, which integrates to exactly
+    // 1-(1-t/T)^p going in and (1-t/T)^q coming out. Both leave their rest value
+    // at full speed and land soft, both finish in finite time, and — the reason
+    // it is done this way — a mind changed halfway through reverses continuously
+    // instead of snapping between two different curves.
+    const v0 = this._adsRaw;
+    if (adsGoal) {
+      const T = Math.max(0.05, cfg.adsTime * 0.88);
+      this._adsRaw = Math.min(1, v0 + (ADS_IN_P / T) * Math.pow(1 - v0, 1 - 1 / ADS_IN_P) * dt);
+    } else {
+      const T = Math.max(0.05, cfg.adsTime * 0.74);
+      this._adsRaw = Math.max(0, v0 - (ADS_OUT_P / T) * Math.pow(v0, 1 - 1 / ADS_OUT_P) * dt);
+    }
+    this.adsT = this._adsRaw;
     this._adsWritten = this.adsT;
     const a = this.adsT;
 
-    // --- fire control
-    this._cool -= dt;
+    // --- FOV compression. Aiming has to magnify the world or it is just the gun
+    // moving; this is the half of ADS the player actually reads. The camera
+    // belongs to main.js, so it is written only when the value really changes and
+    // is handed back untouched on dispose().
+    if (this._fovBase > 0) {
+      const f = this._fovBase + (this._fovAds - this._fovBase) * a;
+      if (Math.abs(f - this.camera.fov) > 1e-4) {
+        this.camera.fov = f;
+        this.camera.updateProjectionMatrix();
+        this._fovWritten = f;
+      }
+    }
+
+    // --- fire control. The cooldown is floored: it may bank a couple of rounds
+    // of catch-up credit after a frame stall, never a whole magazine's worth
+    // after a 2.6s reload. Without the floor a held trigger repays the entire
+    // reload as a 3-round-a-frame dump the instant the gun comes back.
+    this._cool = Math.max(this._cool - dt, -0.18);
     this._sinceShot += dt;
     this._heat = Math.max(0, this._heat - dt * (this._sinceShot > 0.25 ? 1.6 : 0));
     this._bloom = Math.max(0, this._bloom - dt * (this._sinceShot > 0.12 ? 2.4 : 0));
@@ -394,6 +483,22 @@ export class ViewModel {
     this.ready = !this.reloading && this._raise <= 0 && !sprinting && this._sprintT < 0.35;
     if (this.reloading) this._stepReload(dt);
     else this._tryFire(dt, crouch, grounded, speed);
+
+    // --- dry-magazine auto-reload. A held trigger must never produce a dead
+    // frame. This routes through reload() itself rather than duplicating it, so
+    // the RELOAD phases, the RELOAD_EMPTY choreography and the WEAPON_STATE
+    // snapshots are indistinguishable from a manual reload. The short delay is
+    // deliberate: the last muzzle flash and the bolt locking back both have to be
+    // seen before the hands move, or the mag change looks like a dropped frame.
+    if (this._autoReload >= 0) {
+      if (this.reloading || this.ammo > 0 || this.reserve <= 0) this._autoReload = -1;
+      else {
+        this._autoReload = Math.max(0, this._autoReload - dt);
+        // Not ready (sprinting, or still bringing the weapon back up) just holds
+        // the request; it fires the moment the gun is available again.
+        if (this._autoReload === 0 && this.ready) { this._autoReload = -1; this.reload(); }
+      }
+    }
     // The charge cycle runs on its own clock so it can finish even if the
     // reload is cancelled out from under it.
     if (this._chargeT > 0) this._chargeT += dt;
@@ -461,7 +566,12 @@ export class ViewModel {
 
     if (!wants) return;
     if (this.ammo <= 0) {
-      // Dry fire: the trigger still moves and the click is worth hearing.
+      // Pulling on an empty magazine with rounds left in reserve is a request to
+      // reload, not a request to hear a click. Skips the delay the auto path
+      // uses: the player has already told us what they want.
+      if (this.reserve > 0) { this._autoReload = -1; this.reload(); return; }
+      // Genuinely out. Dry fire: the trigger still moves and the click is worth
+      // hearing.
       if (mode !== 'auto' || this._cool <= -0.12) {
         this._trigPull = 1;
         this._cool = 0.12;
@@ -549,12 +659,56 @@ export class ViewModel {
     this._shotMsg.spread = spread;
     this._shotMsg.index = i;
     bus.emit(EV.SHOT, this._shotMsg);
+
+    // That was the last round: arm the auto-reload rather than letting the next
+    // trigger frame find a dead gun.
+    if (this.ammo === 0 && this.reserve > 0 && this._autoReload < 0) {
+      this._autoReload = AUTO_RELOAD_DELAY;
+    }
+  }
+
+  /**
+   * Fire one round immediately, bypassing the fire-rate cooldown, the trigger
+   * state and the ready gate. Returns true when a round left the barrel.
+   *
+   * This exists for the screenshot harness. A muzzle flash lives for one or two
+   * frames, so a settled capture lands on the gap between rounds almost every
+   * time and the frame that is supposed to sell a firefight shows a quiet gun.
+   * It is therefore contractually required to produce a shot: an empty magazine
+   * is reloaded from reserve first, an in-flight reload is resolved rather than
+   * waited on, and in the degenerate case of no reserve at all a round is staged
+   * so the harness still gets its flash.
+   */
+  forceShot() {
+    if (this.reloading) {
+      this._loadMag();
+      this.reloading = false;
+      this._chargeT = 0;
+      this._reloadPhase = this._reloadSeq.length;
+      bus.emit(EV.RELOAD, { phase: 'end', weapon: this.cfg });
+    }
+    if (this.ammo <= 0) {
+      this._loadMag();
+      // Two, not one, so the bolt cycles home after the shot instead of locking
+      // back — a captured frame should not show a gun that has just run dry.
+      if (this.ammo <= 0) this.ammo = 2;
+    }
+    this._autoReload = -1;
+    this._raise = 0;
+    const pl = this.player;
+    const crouch = typeof pl.crouch === 'number' ? sat(pl.crouch) : (pl.crouch ? 1 : 0);
+    this._fire(crouch, pl.grounded !== false, pl.speed || 0);
+    // Rejoin the normal cadence: the next scheduled round still waits its turn.
+    this._cool = 60 / this.cfg.rpm;
+    bus.emit(EV.WEAPON_STATE, this.snapshot());
+    return true;
   }
 
   // ------------------------------------------------------------------ reload
   _cancelReload() {
     if (!this.reloading) return;
     this.reloading = false;
+    this._cool = Math.max(this._cool, 0);
     this._chargeT = 0;
     bus.emit(EV.RELOAD, { phase: 'end', cancelled: true, weapon: this.cfg });
   }
@@ -572,6 +726,9 @@ export class ViewModel {
       if (phase === 'end') {
         this._loadMag();                                     // safety net
         this.reloading = false;
+        // A fresh magazine starts the fire clock, so the first round out of it
+        // is one round and not the catch-up the reload would otherwise owe.
+        this._cool = Math.max(this._cool, 0);
         bus.emit(EV.RELOAD, { phase: 'end', weapon: this.cfg });
         return;
       }
@@ -627,6 +784,8 @@ export class ViewModel {
     t[SP.LAG_RY] = clamp(-yv * 0.115, -0.20, 0.20) * rotScale;
     t[SP.LAG_RX] = clamp(-pv * 0.100, -0.16, 0.16) * rotScale;
     t[SP.LAG_RZ] = clamp(yv * 0.070, -0.13, 0.13) * rotScale;
+    // Clamps are pre-NEAR_COMP metres; on screen they are the same swing they
+    // always were, because _pose scales the whole offset sum.
     t[SP.LAG_X] = clamp(yv * 0.0125, -0.030, 0.030) * posScale;
     t[SP.LAG_Y] = clamp(-pv * 0.0090, -0.022, 0.022) * posScale;
     t[SP.ADS] = a;
@@ -741,18 +900,34 @@ export class ViewModel {
     const heave = s[SP.HEAVE];
     const cr = crouch * (1 - sp);
 
-    // --- rotation
+    // --- ADS blend parameter. Allowed slightly out of range so the settle
+    // spring's overshoot survives: the gun rolls a touch past level and comes
+    // back, which is most of what sells the raise as weighted.
+    const ap = clamp(s[SP.ADS], -0.12, 1.12);
+    const hip = 1 - ap;
+
+    // --- the raise is an arc, not a slide. A bell over the transition, zero at
+    // both settled ends so neither rest pose is disturbed: the muzzle dips and
+    // the cant rolls out early while the mass is still catching up, then the
+    // rifle comes up into the eye. Without this the sight simply translates.
+    const arc = sat(4 * ap * (1 - ap));
+    const arcRX = -0.055 * arc, arcRZ = -0.045 * arc;
+    const arcY = -0.010 * arc, arcZ = 0.014 * arc;
+
+    // --- rotation. The hip rest angles blend out completely by full ADS: any
+    // yaw or pitch left in at the sight picture walks the dot off centre.
     this._euler.set(
-      s[SP.LAG_RX] + swayRX + bobRX + spRX + lrRX + insRX + rlRX + s[SP.KICK_RX] + cr * 0.035,
-      s[SP.LAG_RY] + spRY + insRY + rlRY + s[SP.KICK_RY],
-      s[SP.LAG_RZ] + swayRZ + bobRZ + spRZ + insRZ + rlRZ + s[SP.KICK_RZ],
+      HIP_RX * hip + arcRX
+        + s[SP.LAG_RX] + swayRX + bobRX + spRX + lrRX + insRX + rlRX + s[SP.KICK_RX] + cr * 0.035,
+      HIP_RY * hip
+        + s[SP.LAG_RY] + spRY + insRY + rlRY + s[SP.KICK_RY],
+      HIP_RZ * hip + arcRZ
+        + s[SP.LAG_RZ] + swayRZ + bobRZ + spRZ + insRZ + rlRZ + s[SP.KICK_RZ],
       'YXZ',
     );
     this._quat.setFromEuler(this._euler);
 
     // --- pivot blend: shoulder at the hip, dead on the optic at full ADS.
-    // Allowed slightly out of range so the settle spring's overshoot survives.
-    const ap = clamp(s[SP.ADS], -0.12, 1.12);
     this._pivot.lerpVectors(this._hipPivot, this._opticLocal, ap);
     this._pos.lerpVectors(this._hipBase, this._adsBase, ap);
     // pos = base + pivot - R*pivot  →  the rotation happens about `pivot`
@@ -760,10 +935,16 @@ export class ViewModel {
     _tmp.copy(this._pivot).applyQuaternion(this._quat);
     this._pos.sub(_tmp);
 
-    this._pos.x += s[SP.LAG_X] + swayX + bobX + spX + insX + rlX;
-    this._pos.y += s[SP.LAG_Y] + swayY + breathe + bobY + kickY + jolt + spY + lrY + insY
-      + rlY - cr * 0.010;
-    this._pos.z += bobZ + kickZ + spZ + lrZ + insZ + rlZ - heave * 0.012 - cr * 0.006;
+    // Everything from here is a small positional offset in metres, and the rest
+    // pose sits close enough to the eye that a millimetre is worth roughly twice
+    // the screen angle these numbers were tuned against. NEAR_COMP takes the
+    // angular amplitude back to the tuned value in one place, so the relative
+    // weighting of sway against bob against kick is untouched.
+    this._pos.x += (s[SP.LAG_X] + swayX + bobX + spX + insX + rlX) * NEAR_COMP;
+    this._pos.y += (s[SP.LAG_Y] + swayY + breathe + bobY + kickY + jolt + spY + lrY + insY
+      + rlY + arcY - cr * 0.010) * NEAR_COMP;
+    this._pos.z += (bobZ + kickZ + spZ + lrZ + insZ + rlZ + arcZ
+      - heave * 0.012 - cr * 0.006) * NEAR_COMP;
 
     this.rig.position.copy(this._pos);
     this.rig.quaternion.copy(this._quat);
