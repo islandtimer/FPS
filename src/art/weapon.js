@@ -47,8 +47,8 @@
 // 5cm near plane and gets sliced by it. A box sliced that way loses its front
 // faces and renders as a shredded, zero-thickness plate stretching off past the
 // silhouette. Everything aft of the receiver is therefore either wholly behind
-// that line (the stock, which vanishes cleanly) or below y = +0.009 (the buffer
-// tube), where it is under the bottom edge of the frustum. The charging handle
+// that line (the stock, which vanishes cleanly) or below y = +0.005 (the buffer
+// tube), where it passes under the bottom edge of the frustum. The charging handle
 // is on the left flank for the same reason — a top-mounted one sits 5cm from
 // the eyeball at ADS and can only ever be debris.
 //
@@ -106,12 +106,25 @@ const RAIL_F = -0.104;                     // rail teeth stop here: forward of
 const PRESENCE = 1.08;
 const ADS_EYE = 0.142;
 const OPTIC_Z = -0.018;
-const EYE_Z = (ADS_EYE + OPTIC_Z * PRESENCE * -1 * -1) / PRESENCE + OPTIC_Z * 0;
-// = (ADS_EYE - PRESENCE*|OPTIC_Z|) / PRESENCE, written out so the sign is plain:
-const EYE_ZR = (ADS_EYE + OPTIC_Z * PRESENCE) / PRESENCE;
+// weaponfx puts the rig at z = -(ADS_EYE + PRESENCE*OPTIC_Z), so a rifle point
+// lands at camera z = PRESENCE*zr - that, and the eye itself is at:
+const EYE_ZR = ADS_EYE / PRESENCE + OPTIC_Z;          // +0.1135
+// Aft of this, geometry straddles the 5cm near plane at ADS and gets sliced
+// open. It is the hardest constraint in the file.
+const NEAR_ZR = EYE_ZR - 0.05 / PRESENCE;             // +0.0672
 
-// Aft of this, geometry straddles the 5cm near plane at ADS and gets sliced.
-const NEAR_ZR = 0.067;
+// Tiles per metre for the box projection, per bucket.
+//
+// These went UP sharply this round, and the reason is the speckle. A baked
+// micro-feature has to sit either well under a pixel, where the mip chain
+// averages it into a tone, or well over three, where it reads as a feature. At
+// the old 15 tiles/m the gunmetal phosphate cell landed at 0.6mm, which at 30cm
+// is almost exactly one pixel: the worst possible size, and it rendered as
+// uniform white salt and pepper at identical density on the lit face and the
+// shadowed one. At 46 tiles/m the same cell is 0.2mm and mips down to grain.
+// Everything above that scale is now carried by the vertex mask instead, which
+// is the layer that actually knows where the part's edges are.
+const UV = { coat: 52, bare: 46, poly: 14, rub: 24, glove: 15, clear: 4 };
 
 // ---------------------------------------------------------------- geometry kit
 
@@ -191,18 +204,19 @@ function colorAttr(g, n) {
  *           chamfered box that is exactly the set of milled corners.
  *   'rim'   the two ends of a lathe profile: muzzle crown, bezel lip, tube mouth.
  */
-function paint(g, w) {
+function paint(g, w, k = 1) {
   const c = colorAttr(g, 3);
   const a = c.array;
   const n = g.getAttribute('normal');
   const p = g.getAttribute('position');
   if (w === 'edge' && n) {
     const na = n.array;
+    const amp = (1 - FIELD) * k;
     for (let i = 0, j = 0; i < c.count; i++, j += 3) {
       const mx = Math.max(Math.abs(na[j]), Math.abs(na[j + 1]), Math.abs(na[j + 2]));
       // 1.0 on an axis face, 0.707 on a two-axis land, 0.577 on a corner
       const e = Math.min(1, Math.max(0, (0.985 - mx) / 0.26));
-      const v = FIELD + (1 - FIELD) * e * e * (3 - 2 * e);
+      const v = FIELD + amp * e * e * (3 - 2 * e);
       a[j] = v; a[j + 1] = v; a[j + 2] = v;
     }
   } else if (w === 'rim' && p) {
@@ -281,7 +295,11 @@ function cbox(w, h, d, c = 0.0014) {
     ...EX, depth: Math.max(0.0002, d - 2 * c), bevelThickness: c, bevelSize: c,
   });
   g.translate(0, 0, -(d / 2 - c));
-  paint(g, 'edge');
+  // Scale the highlight with the land it sits on. A 1.4mm chamfer on the
+  // receiver is three pixels of bright metal at 30cm and reads as machining; the
+  // same value on a 0.3mm grip rib is a sub-pixel white line, which is how you
+  // trade one kind of sparkle aliasing for another.
+  paint(g, 'edge', Math.min(1, 0.34 + c / 0.0014 * 0.66));
   return g;
 }
 
@@ -463,7 +481,8 @@ function slotStrip(w, z0, z1, pitch, land, cLand, cSlot) {
   let k = 0, ku = 0;
   const hw = w / 2;
   for (const [za, zb, cv] of bands) {
-    const quad = [[-hw, za], [hw, za], [hw, zb], [-hw, za], [hw, zb], [-hw, zb]];
+    // wound so the face points +Y
+    const quad = [[-hw, za], [hw, zb], [hw, za], [-hw, za], [-hw, zb], [hw, zb]];
     for (const [x, zz] of quad) {
       pos[k] = x; pos[k + 1] = 0; pos[k + 2] = zz;
       nor[k] = 0; nor[k + 1] = 1; nor[k + 2] = 0;
@@ -620,9 +639,22 @@ const SPECS = {
 
 // ---------------------------------------------------------------- sight solve
 
-/** Clear aperture of the objective. Deliberately generous: the tube wall is a
- *  wall, not a lens mount, so the hole is most of the outside diameter. */
-function aperture(s) { return s.opticR * 0.84; }
+/**
+ * Clear aperture of the objective. Wide by default — the tube wall is a wall,
+ * not a lens mount — but never wider than the muzzle allows. The muzzle device
+ * is the one part that cannot be moved down out of the way: it is on the bore,
+ * 50-60cm out, and on a long barrel it will always creep into a big window. So
+ * the window is closed down until the muzzle falls inside the vignette band
+ * instead. A slightly smaller sight picture is a design decision; a rifle
+ * blocking its own sight picture is a bug.
+ */
+function aperture(s) {
+  const frontRim = OPTIC_Z - s.opticLen / 2 + 0.002;
+  const muzzleZ = -0.088 - s.barrel - s.brakeLen;
+  const muzzleTop = BORE_Y + s.brakeR;
+  const cap = (SIGHT_Y - muzzleTop) * (EYE_ZR - frontRim) / (0.85 * (EYE_ZR - muzzleZ));
+  return Math.min(s.opticR * 0.84, cap);
+}
 
 /** Half-angle of the cone the eye sees through the objective, from the eye. */
 function exitCone(s) {
@@ -690,7 +722,7 @@ function buildUpper(B, s, rng) {
   // piece of wear on a rifle that is unmistakably from a hand.
   put(B.coat, cbox(0.0035, 0.0055, 0.070, 0.0007), { x: -0.0196, y: 0.0088, z: -0.026 });
   put(B.coat, cbox(0.0035, 0.0055, 0.070, 0.0007), { x: -0.0196, y: -0.0022, z: -0.026 });
-  put(B.bare, cbox(0.0022, 0.0044, 0.068, 0.0004), { x: -0.0188, y: 0.0033, z: -0.026 }, 0.92);
+  put(B.bare, cbox(0.0026, 0.0050, 0.074, 0.0005), { x: -0.0209, y: 0.0033, z: -0.026 }, 0.94);
 
   // QD sling socket, receiver rear left
   put(B.bare, qdSocket(0.0062), { x: -0.0208, y: -0.012, z: 0.044, ry: -Math.PI / 2 });
@@ -707,7 +739,9 @@ function buildRail(B, s) {
   const L = z0 - z1, zC = (z0 + z1) / 2;
   // Rail BASE is part of the receiver: coated, same family, same value.
   put(B.coat, frustumBox(0.0210, L, 0.0180, L, 0.0025), { y: RAIL_BOT + 0.00125, z: zC });
-  put(B.coat, frustumBox(0.0186, L, 0.0210, L, 0.0020), { y: RAIL_BOT + 0.0035, z: zC });
+  // Flat 0.44 on the base: this face IS the slot floor between the teeth, and it
+  // has to sit under them in value or the rail reads as a ladder of dark bars.
+  put(B.coat, frustumBox(0.0186, L, 0.0210, L, 0.0020), { y: RAIL_BOT + 0.0035, z: zC }, 0.44);
   // The TEETH are bare machined aluminium — a different material from the thing
   // they stand on, which is both true of a real rail and the cheapest way to
   // stop the top of the gun reading as one extruded black mass. Modelled
@@ -797,6 +831,7 @@ function buildHandguard(B, s, rng) {
   // does not get noisy where it is closest to the eye.
   const near = Math.max(1, s.mlok - 1);
   const facets = [[0, s.mlok], [45, 0], [90, -1], [135, 0], [180, s.mlok], [225, near], [270, near], [315, near]];
+  let minMid = Infinity;    // closest any facet comes to the axis
   for (const [deg, slots] of facets) {
     const phi = (deg * Math.PI) / 180;
     const a0 = phi - Math.PI / 8, a1 = phi + Math.PI / 8;
@@ -805,13 +840,19 @@ function buildHandguard(B, s, rng) {
     const p1x = Math.cos(a1) * r1, p1y = Math.sin(a1) * r1;
     const wide = Math.hypot(p1x - p0x, p1y - p0y) + 0.0008;
     const mx = (p0x + p1x) / 2, my = (p0y + p1y) / 2;
-    const nAng = Math.atan2(p1x - p0x, -(p1y - p0y));   // outward normal angle
+    // outward normal of a CCW edge is the edge direction turned -90 degrees
+    const nAng = Math.atan2(-(p1x - p0x), p1y - p0y);
     const ox = mx - Math.cos(nAng) * tY / 2, oy = my - Math.sin(nAng) * tY / 2;
+    minMid = Math.min(minMid, Math.hypot(mx, my));
 
     if (slots < 0) {
-      // Top deck: plain plank, with the rail slots painted onto it.
-      put(B.poly, cbox(wide, tY, L - 0.010, 0.0010), { x: ox, y: cy + oy, z: zC, rz: nAng - Math.PI / 2 });
-      put(B.poly, slotStrip(wide * 0.92, zF + 0.008, zR - 0.006, 0.0102, 0.0058, 0.86, 0.34),
+      // Top deck. The rail carries on over the forend as a coated base with the
+      // teeth PAINTED on: same two materials as the cut section behind it, so
+      // the handover at the receiver joint is invisible, and no 1px silhouette
+      // to crawl. Everything forward of the receiver is seen at a grazing angle
+      // through the bottom of the optic, where relief buys nothing anyway.
+      put(B.coat, cbox(wide, tY, L - 0.010, 0.0010), { x: ox, y: cy + oy, z: zC, rz: nAng - Math.PI / 2 });
+      put(B.bare, slotStrip(wide * 0.97, zF + 0.008, zR - 0.006, 0.0102, 0.0058, 0.96, 0.30),
         { x: ox + Math.cos(nAng) * (tY / 2 + 0.00018), y: cy + oy + Math.sin(nAng) * (tY / 2 + 0.00018) });
       continue;
     }
@@ -821,10 +862,15 @@ function buildHandguard(B, s, rng) {
     putAll(B.poly, geos, { x: ox, y: cy + oy, z: zC, rz: nAng - Math.PI / 2 });
   }
   // Inner shroud, so the slots read as holes with something behind them, and it
-  // is dark down there: that is where the grime is on a real forend.
-  put(B.poly, tubeZ(R - 0.0075, R - 0.0075, L - 0.014, 14, true), { y: cy, z: zC }, GRIME * 0.7);
-  put(B.poly, ringZ(R - 0.0095, rTop + 0.0005, 0.008, 14), { y: cy, z: zF + 0.008 }, 'rim');
-  put(B.poly, ringZ(R - 0.0100, R + 0.0018, 0.014, 14), { y: cy, z: zR }, 'rim');
+  // is dark down there: that is where the grime is on a real forend. Sized off
+  // the CLOSEST facet, not off R — the section is flattened over the bore, and a
+  // shroud cut to the widest radius pushes straight out through the top deck.
+  const shroudR = Math.max(0.0072, minMid - tY - 0.0008);
+  put(B.poly, tubeZ(shroudR, shroudR, L - 0.014, 14, true), { y: cy, z: zC }, GRIME * 0.7);
+  // Front cap can never be wider than the closest facet either, or it stands
+  // proud of the deck exactly where the sight is looking.
+  put(B.poly, ringZ(shroudR - 0.0012, minMid - 0.0003, 0.008, 14), { y: cy, z: zF + 0.008 }, 'rim');
+  put(B.poly, ringZ(shroudR - 0.0012, R + 0.0018, 0.014, 14), { y: cy, z: zR }, 'rim');
 
   // barrel nut the handguard clamps to, and the clamp screws
   put(B.coat, latheZ([
@@ -838,7 +884,6 @@ function buildHandguard(B, s, rng) {
   }
   // QD socket at 3 o'clock, forward
   put(B.bare, qdSocket(0.0062), { x: R - 0.001, y: cy, z: zF + 0.032, ry: Math.PI / 2 });
-  return { topY, rad };
 }
 
 // ---------------------------------------------------------------- lower
@@ -885,8 +930,8 @@ function buildLower(B, s, rng) {
   // Receiver extension. Coaxial with the bore, and its top is 45mm under the
   // sight axis so it passes below the bottom edge of the frustum at ADS instead
   // of being sliced open by the near plane.
-  put(B.coat, tubeZ(0.0132, 0.0132, s.stockLen + 0.030, 16), { y: BORE_Y, z: 0.056 + (s.stockLen + 0.030) / 2 });
-  put(B.bare, latheZ([[0.0132, 0], [0.0158, 0], [0.0158, 0.008], [0.0132, 0.008]], 12), { y: BORE_Y, z: 0.0640 }, 'rim');
+  put(B.coat, tubeZ(0.0126, 0.0126, s.stockLen + 0.030, 16), { y: BORE_Y, z: 0.056 + (s.stockLen + 0.030) / 2 });
+  put(B.bare, latheZ([[0.0126, 0], [0.0152, 0], [0.0152, 0.008], [0.0126, 0.008]], 12), { y: BORE_Y, z: 0.0640 }, 'rim');
   put(B.coat, cbox(0.034, 0.030, 0.004, 0.0010), { y: -0.011, z: 0.0565 });
   put(B.bare, qdSocket(0.0058), { x: -0.015, y: -0.016, z: 0.0585, ry: -Math.PI / 2 });
 }
@@ -949,7 +994,7 @@ function buildGrip(B) {
  * the hip it is where it always was: bottom right, half out of frame.
  */
 function buildStock(B, s, rng) {
-  const z0 = 0.090, L = s.stockLen, zC = z0 + L * 0.50;
+  const z0 = NEAR_ZR + 0.023, L = s.stockLen, zC = z0 + L * 0.50;
   const top = 0.0005;
   put(B.poly, cbox(0.036, 0.030, 0.040, 0.0025), { y: top - 0.016, z: z0 + 0.018 });
   put(B.poly, cbox(0.031, 0.013, L * 0.86, 0.0022), { y: top - 0.007, z: zC });
@@ -989,15 +1034,18 @@ function buildOptic(B, s, rng) {
   // Straight tube with proud bezel rings at each end. A waisted profile reads as
   // a beer keg the moment smooth normals get hold of it, so the body stays
   // cylindrical and the diameter changes happen at hard steps.
+  const Rend = Math.max(R * 0.88, Ra + 0.0009);   // must never undercut the bore
   put(B.coat, latheZ([
-    [R * 0.82, 0], [R * 0.99, 0.003], [R, 0.007], [R, L - 0.007],
-    [R * 0.99, L - 0.003], [R * 0.82, L],
+    [Rend, 0], [R * 0.99, 0.003], [R, 0.007], [R, L - 0.007],
+    [R * 0.99, L - 0.003], [Rend, L],
   ], 28), { y: SIGHT_Y, z: zR });
   put(B.coat, ringZ(Ra, R * 1.07, 0.0055, 28), { y: SIGHT_Y, z: zR }, 'rim');
   put(B.coat, ringZ(Ra, R * 1.07, 0.0055, 28), { y: SIGHT_Y, z: zF + 0.0055 }, 'rim');
   // The bore, wound inside out so it is actually visible from the shooter's eye.
   // Matte black down the tube, which is what gives the sight picture its depth.
-  put(B.coat, flipFaces(tubeZ(Ra, Ra, L - 0.012, 28, true)), { y: SIGHT_Y, z: zC }, DARK * 0.8);
+  // Long enough to overlap both bezels: leave a 0.5mm axial gap and the tube
+  // leaks daylight round the back of the objective ring.
+  put(B.coat, flipFaces(tubeZ(Ra, Ra, L - 0.004, 28, true)), { y: SIGHT_Y, z: zC }, DARK * 0.8);
 
   // turrets: short, stepped, flat shaded so the facets read as knurling
   const turrets = [[0, 1, -Math.PI / 2, 0], [1, 0, 0, Math.PI / 2]];
@@ -1011,22 +1059,34 @@ function buildOptic(B, s, rng) {
   }
   put(B.coat, flat(tubeZ(0.0074, 0.0084, 0.008, 12)), { x: -(R + 0.002), y: SIGHT_Y, z: zC + 0.004, ry: -Math.PI / 2 });
 
-  // mount: saddle, riser down to the rail, clamp jaw, cross bolt, throw lever
-  put(B.coat, cbox(0.030, 0.014, 0.036, 0.0016), { y: SIGHT_Y - R - 0.004, z: zC });
-  const riserH = Math.max(0.004, SIGHT_Y - R - RAIL_TOP + 0.003);
-  put(B.coat, cbox(0.026, riserH, 0.034, 0.0016), { y: SIGHT_Y - R - 0.008 - riserH / 2 + 0.002, z: zC });
+  // Mount: saddle, riser down to the rail, clamp jaw, cross bolts, throw lever.
+  //
+  // FLOOR is the hard limit for every one of these. The bore runs closer to the
+  // axis than the tube's outer surface does, so a saddle sized off R quietly
+  // pushes half a millimetre up THROUGH the bore floor and appears as a bright
+  // slab lying in the bottom of the sight picture. That is what the cross bolts
+  // and the saddle were doing: two stacked bars inside the glass.
+  const FLOOR = SIGHT_Y - Math.min(Ra, R) - 0.0012;
+  put(B.coat, cbox(0.030, 0.016, 0.036, 0.0016), { y: FLOOR - 0.008, z: zC });
+  const riserH = Math.max(0.004, FLOOR - 0.016 - RAIL_TOP + 0.005);
+  put(B.coat, cbox(0.026, riserH, 0.034, 0.0016), { y: FLOOR - 0.016 + riserH / 2 - 0.002, z: zC });
   put(B.coat, cbox(0.034, 0.011, 0.030, 0.0014), { y: RAIL_TOP - 0.0015, z: zC });
   put(B.bare, tubeZ(0.0030, 0.0030, 0.036, 8), { y: RAIL_TOP - 0.002, z: zC + 0.009, ry: Math.PI / 2 }, 0.80);
   // throw lever, folded flat against the mount the way it is carried
   put(B.bare, cbox(0.0045, 0.007, 0.020, 0.0007), { x: -0.0185, y: RAIL_TOP - 0.0015, z: zC + 0.004 });
   put(B.bare, flat(tubeZ(0.0042, 0.0042, 0.004, 8)), { x: -0.0185, y: RAIL_TOP - 0.0015, z: zC + 0.013, ry: -Math.PI / 2 }, 'rim');
-  for (const bz of [zC - 0.011, zC + 0.011]) {
-    put(B.bare, screw(0.0026, 0.0018, rng() * Math.PI), { y: SIGHT_Y - R + 0.004, z: bz, rx: -Math.PI / 2 });
+  // Clamp bolts through the flanks of the saddle, not up through the tube.
+  for (const bz of [zC - 0.012, zC + 0.012]) {
+    for (const sx of [-1, 1]) {
+      put(B.bare, screw(0.0026, 0.0018, rng() * Math.PI),
+        { x: sx * 0.0152, y: FLOOR - 0.008, z: bz, ry: sx * Math.PI / 2 });
+    }
   }
-  // Emitter pod, in the wall UNDER the bore rather than inside it. Sitting in
-  // the light path it clipped the bottom of the sight picture for no gain.
-  put(B.coat, cbox(0.009, 0.006, 0.012, 0.0009), { y: SIGHT_Y - R - 0.0015, z: zF + 0.017 });
-  put(B.coat, cbox(0.006, 0.004, 0.005, 0.0006), { y: SIGHT_Y - R - 0.005, z: zF + 0.020 });
+  // Emitter pod, in the wall UNDER the bore rather than inside it, and forward
+  // of the saddle so it reads as its own part. Sitting in the light path it
+  // clipped the bottom of the sight picture for no gain.
+  put(B.coat, cbox(0.010, 0.007, 0.013, 0.0009), { y: FLOOR - 0.0035, z: zF + 0.006 });
+  put(B.coat, cbox(0.007, 0.004, 0.006, 0.0006), { y: FLOOR - 0.0085, z: zF + 0.009 });
 
   // ------------------------------------------------------------- the glass
   // One pane, and it carries three jobs in its vertex colour: a nearly clear
@@ -1050,18 +1110,12 @@ function buildOptic(B, s, rng) {
   // at the same value as the white HUD cross.
   put(B.glow, discZ([
     [0.00000, 1.00, 1.00, 1.00, 1.00, 0],
-    [0.00085, 1.00, 0.98, 0.95, 0.98, 0],
-    [0.00120, 0.90, 0.42, 0.30, 0.62, 0],
-    [0.00175, 0.80, 0.16, 0.09, 0.24, 0],
-    [0.00250, 0.72, 0.10, 0.05, 0.075, 0],
-    [0.00340, 0.70, 0.08, 0.04, 0.000, 0],
+    [0.00072, 1.00, 0.97, 0.94, 0.96, 0],
+    [0.00098, 0.92, 0.40, 0.28, 0.48, 0],
+    [0.00140, 0.82, 0.15, 0.08, 0.15, 0],
+    [0.00200, 0.74, 0.09, 0.04, 0.035, 0],
+    [0.00280, 0.72, 0.07, 0.03, 0.000, 0],
   ], 22), { y: SIGHT_Y, z: zF + 0.0118 });
-  // A hint of the emitter's own spill on the floor of the tube, so the dot has a
-  // source instead of hanging in space.
-  put(B.glow, discZ([
-    [0.0000, 0.55, 0.10, 0.05, 0.28, 0],
-    [0.0026, 0.50, 0.07, 0.03, 0.00, 0],
-  ], 12), { y: SIGHT_Y - Ra + 0.0005, z: zF + 0.016, rx: -Math.PI / 2 });
 }
 
 // ---------------------------------------------------------------- hands
@@ -1081,7 +1135,7 @@ function handPoint(out, x, ang, r) {
 
 /**
  * Gloved hand wrapped around a cylinder of radius `r`.
- * o: { r, a0, dir, n, span, fw, ft, thumbA, wristA, ox/oy/oz + basis }
+ * o: { r, a0, dir, n, span, peak, fw, ft, thumbA, wristA, ox/oy/oz + basis }
  */
 function buildHand(B, o) {
   const skin = [], pads = [];
@@ -1090,7 +1144,9 @@ function buildHand(B, o) {
   const A = new THREE.Vector3(), Bv = new THREE.Vector3();
   for (let i = 0; i < n; i++) {
     const x = x0 + i * span;
-    const rel = Math.abs(i - (n - 1) * 0.42);
+    // Longest finger sits next to the thumb end, not at the middle of the row:
+    // the little finger is at -X and has to be visibly the short one.
+    const rel = Math.abs(i - o.peak);
     const t = o.ft * (1 - rel * 0.055);
     const w = o.fw * (1 - rel * 0.07);
     const reach = 1 - rel * 0.055;
@@ -1120,12 +1176,23 @@ function buildHand(B, o) {
     }
   }
 
-  // back of the hand and the heel, behind the knuckle line
+  // Back of the hand and the heel, behind the knuckle line, tapering toward the
+  // wrist. This is the only part of the support hand any camera in the game
+  // actually sees — the fingers are under the forend — so it carries the read,
+  // and two equal slabs read as two boxes stuck to a tube.
   const bw = (n - 1) * span + o.fw * 1.25;
-  for (const [dA, rOff, th, len] of [[-0.55, 0.009, 0.016, 0.040], [-1.15, 0.010, 0.019, 0.032]]) {
+  for (const [dA, rOff, th, len, wf] of [[-0.55, 0.009, 0.016, 0.040, 1.0], [-0.95, 0.005, 0.015, 0.028, 0.82]]) {
     const am = o.a0 + dir * dA;
     const rc = o.r + rOff;
-    skin.push(xf(cbox(bw, th, len, 0.0025), { x: 0, y: Math.cos(am) * rc, z: Math.sin(am) * rc, rx: am }));
+    skin.push(xf(cbox(bw * wf, th, len, 0.0025), { x: 0, y: Math.cos(am) * rc, z: Math.sin(am) * rc, rx: am }));
+  }
+  // Knuckles, standing proud of the back of the hand. Four bumps is the whole
+  // difference between a hand and a mitten at this distance.
+  for (let i = 0; i < n; i++) {
+    const am = o.a0 + dir * -0.30;
+    const rc = o.r + 0.009 + 0.008 + 0.0015;
+    skin.push(xf(cbox(span * 0.72, 0.0042, 0.0130, 0.0012),
+      { x: x0 + i * span, y: Math.cos(am) * rc, z: Math.sin(am) * rc, rx: am }));
   }
   // two longitudinal seams down the back of the hand
   for (const sx of [-0.26, 0.26]) {
@@ -1135,16 +1202,18 @@ function buildHand(B, o) {
       { x: bw * sx, y: Math.cos(am) * rc, z: Math.sin(am) * rc, rx: am }));
   }
 
-  // thumb: two segments, lying along the grip axis
+  // Thumb: two segments lying along the grip axis, past the index finger — the
+  // +X end, not the -X end, which is where the little finger is.
   {
+    const xT = x0 + (n - 1) * span;
     const am = o.thumbA;
     const rc = o.r + 0.0085;
-    skin.push(xf(cbox(0.026, 0.0145, 0.0165, 0.0018),
-      { x: x0 - 0.004, y: Math.cos(am) * rc, z: Math.sin(am) * rc, rx: am }));
-    const am2 = am + dir * 0.30;
+    skin.push(xf(cbox(0.026, 0.0145, 0.0170, 0.0018),
+      { x: xT + 0.014, y: Math.cos(am) * rc, z: Math.sin(am) * rc, rx: am }));
+    const am2 = am + dir * 0.26;
     const rc2 = o.r + 0.0088;
-    skin.push(xf(cbox(0.020, 0.0130, 0.0150, 0.0018),
-      { x: x0 - 0.026, y: Math.cos(am2) * rc2, z: Math.sin(am2) * rc2, rx: am2 }));
+    skin.push(xf(cbox(0.021, 0.0128, 0.0152, 0.0018),
+      { x: xT + 0.033, y: Math.cos(am2) * rc2, z: Math.sin(am2) * rc2, rx: am2 }));
   }
 
   // wrist and cuff. Short on purpose: the forearm is off frame or behind the
@@ -1159,48 +1228,70 @@ function buildHand(B, o) {
       { x: x0 - 0.048, y: Math.cos(am) * rc, z: Math.sin(am) * rc, rx: am }));
   }
 
+  // Contact occlusion, done radially while we are still in the canonical frame:
+  // anything within a couple of millimetres of the cylinder is touching it, and
+  // that crease is what stops the hand looking like it is hovering. A plane-
+  // based seam cannot express this — the contact surface here is a curve.
+  for (const g of skin.concat(pads)) {
+    const p = g.getAttribute('position'), c = colorAttr(g, 3).array;
+    const pa = p.array;
+    for (let i = 0, j = 0; i < p.count; i++, j += 3) {
+      const rr = Math.hypot(pa[j + 1], pa[j + 2]);
+      const d = Math.abs(rr - o.r);
+      if (d > 0.006) continue;
+      const f = 1 - d / 0.006;
+      const mul = 1 - 0.55 * f * f;
+      c[j] *= mul; c[j + 1] *= mul; c[j + 2] *= mul;
+    }
+  }
+
   place(skin, o.ex, o.ey, o.ez, o.ox, o.oy, o.oz);
   place(pads, o.ex, o.ey, o.ez, o.ox, o.oy, o.oz);
   for (const g of skin) B.glove.push(g);
   for (const g of pads) B.rub.push(g);
 }
 
-function buildHands(B, s, hg) {
-  // ---- support hand, wrapped over the forend. Fingers come up from the left,
-  // pass under and finish on the right; the thumb lies forward over the top.
-  const zHand = HG_Z - s.hgLen * 0.60;
+function buildHands(B, s) {
+  // ---- Support hand, UNDER the forend: knuckles low on the left, fingers
+  // curling beneath and up the right side, thumb along the left. An over-the-top
+  // C-clamp puts fingertips 25mm above the bore, which is inside the optic's
+  // exit cone — the hand would sit in the bottom of the sight picture, which is
+  // exactly the defect this round exists to remove.
+  const zHand = HG_Z - s.hgLen * 0.58;
   buildHand(B, {
-    r: s.hgR + 0.0035, a0: 4.712, dir: -1, n: 4, span: 0.0192, fw: 0.0176, ft: 0.0150,
-    thumbA: 5.95, wristA: 4.97,
-    ex: _bx.set(0, 0, -1), ey: _by.set(0, 1, 0), ez: _bz.set(1, 0, 0),
+    r: s.hgR + 0.0035, a0: 4.625, dir: -1, n: 4, span: 0.0192, peak: 1.9,
+    fw: 0.0176, ft: 0.0150, thumbA: 5.15, wristA: 5.30,
+    ex: new THREE.Vector3(0, 0, -1), ey: new THREE.Vector3(0, 1, 0), ez: new THREE.Vector3(1, 0, 0),
     ox: 0, oy: BORE_Y, oz: zHand,
   });
 
-  // ---- firing hand on the pistol grip. Three fingers wrap; the index is built
+  // ---- Firing hand on the pistol grip. Three fingers wrap; the index is built
   // separately because it is on the trigger, not on the grip.
   const rake = -0.34;
-  const up = new THREE.Vector3(0, Math.cos(rake), -Math.sin(-rake)).normalize();
-  up.set(0, Math.cos(rake), Math.sin(rake) * -1).normalize();
+  const up = new THREE.Vector3(0, Math.cos(rake), Math.sin(rake)).normalize();
   const right = new THREE.Vector3(1, 0, 0);
   const fwd = new THREE.Vector3().crossVectors(up, right).normalize();
   buildHand(B, {
-    r: 0.0215, a0: -0.50, dir: 1, n: 3, span: 0.0196, fw: 0.0178, ft: 0.0150,
-    thumbA: 3.05, wristA: -1.55,
+    r: 0.0215, a0: -0.50, dir: 1, n: 3, span: 0.0196, peak: 2.0,
+    fw: 0.0178, ft: 0.0150, thumbA: 3.05, wristA: -1.55,
     ex: up, ey: right, ez: fwd,
     ox: 0, oy: -0.070, oz: 0.028,
   });
 
-  // Trigger finger, laid in absolute coordinates from the knuckle to the shoe.
+  // Trigger finger, laid out in absolute coordinates: knuckle at the top right
+  // of the grip, pad on the shoe inside the guard.
   const pts = [
-    [0.0165, -0.0455, -0.0035],
-    [0.0135, -0.0530, -0.0140],
-    [0.0065, -0.0605, -0.0175],
-    [0.0000, -0.0645, -0.0160],
+    [0.0268, -0.0305, 0.0225],
+    [0.0240, -0.0455, 0.0025],
+    [0.0140, -0.0575, -0.0095],
+    [0.0040, -0.0648, -0.0168],
   ];
   for (let i = 0; i < 3; i++) {
     const a = pts[i], b = pts[i + 1];
+    // up is the back of the finger: near-perpendicular to the run of it, or the
+    // roll comes out arbitrary and the knuckles face sideways
     B.glove.push(boneBox(a[0], a[1], a[2], b[0], b[1], b[2],
-      0.0165 - i * 0.001, 0.0148 - i * 0.0014, 0.35, 0.62, -0.70));
+      0.0166 - i * 0.0012, 0.0150 - i * 0.0016, 0.55, 0.45, -0.70));
   }
 }
 
@@ -1332,12 +1423,12 @@ export function buildWeapon(id, materials) {
   buildUpper(B, s, rng);
   buildRail(B, s);
   buildBarrel(B, s, rng);
-  const hg = buildHandguard(B, s, rng);
+  buildHandguard(B, s, rng);
   buildLower(B, s, rng);
   buildGrip(B);
   buildStock(B, s, rng);
   buildOptic(B, s, rng);
-  buildHands(B, s, hg);
+  buildHands(B, s);
   buildBolt(B);
   buildMag(B, s);
   buildTrigger(B);
@@ -1355,7 +1446,7 @@ export function buildWeapon(id, materials) {
     seam(2, HG_Z - s.hgLen, 0.008, 0.35, { y0: -0.040, y1: 0.030 }),
     // stock and the receiver extension
     seam(2, 0.0585, 0.013, 0.45, { y0: -0.050, y1: 0.020 }),
-    seam(2, 0.092, 0.012, 0.40, { y0: -0.050, y1: 0.020 }),
+    seam(2, NEAR_ZR + 0.023, 0.012, 0.40, { y0: -0.050, y1: 0.020 }),
     // magazine in the well, grip on the lower, trigger guard roots
     seam(1, -0.0205, 0.010, 0.55, { z0: -0.086, z1: -0.006, x0: -0.024, x1: 0.024 }),
     seam(1, -0.049, 0.011, 0.45, { z0: -0.006, z1: 0.044 }),
@@ -1363,8 +1454,8 @@ export function buildWeapon(id, materials) {
     // muzzle device on the barrel shoulder, gas block on the barrel
     seam(2, -0.088 - s.barrel + 0.002, 0.006, 0.45, { y0: -0.030, y1: 0.014 }),
     seam(2, s.gasZ + 0.016, 0.006, 0.35, { y0: -0.030, y1: 0.014 }),
-    // hands: contact shadow where the glove meets what it is holding
-    seam(2, HG_Z - s.hgLen * 0.60, 0.055, 0.30, { y0: -0.045, y1: 0.020 }),
+    // the forend right under the support hand, which is in permanent shadow
+    seam(2, HG_Z - s.hgLen * 0.58, 0.045, 0.30, { y0: -0.040, y1: 0.004, x0: -0.020, x1: 0.020 }),
   ];
 
   // ------------------------------------------------------------- materials
@@ -1377,23 +1468,29 @@ export function buildWeapon(id, materials) {
   // phosphate does not, which is what separates it from the bare parts even
   // where the two are the same value.
   const mCoat = vc(materials.get('paintedMetal', {
-    color: 0x3a4046, roughness: 0.44, metalness: 0.22, envMapIntensity: 1.15,
-    wearStrength: 0.5, grimeStrength: 0.8,
+    color: 0x2b2b26, roughness: 0.44, metalness: 0.22, envMapIntensity: 1.10,
+    wearStrength: 0.35, grimeStrength: 0.85, macroStrength: 0.26,
   }));
   // BARE MACHINED METAL — rail teeth, muzzle, bolt, fasteners, charging handle.
   // Much lighter, much tighter specular, fully metallic. It is the only bright
   // value on the gun and every one of its instances is somewhere a hand or a
   // mount has actually rubbed.
+  // Metalness is deliberately below 1. A fully metallic surface has no diffuse
+  // term at all, so under this scene's deliberately restrained environment
+  // intensity it comes out DARKER than the coated receiver next to it — the rail
+  // teeth were reading as black bars on a light base, which is the exact inverse
+  // of a rail in sunlight. 0.72 keeps a hard specular and buys back enough
+  // diffuse for the part to read light from every angle.
   const mBare = vc(materials.get('gunmetal', {
-    color: 0xb4bac2, roughness: 0.27, metalness: 0.95, envMapIntensity: 1.9,
-    wearStrength: 0.35,
+    color: 0x474339, roughness: 0.33, metalness: 0.72, envMapIntensity: 2.4,
+    wearStrength: 0.30, macroStrength: 0.14,
   }));
   // MATTE STIPPLED POLYMER — handguard, grip, stock, magazine. Warmer, lighter
   // than the receiver and rough enough to have no highlight at all, so the two
   // separate even in flat light.
   const mPoly = vc(materials.get('polymer', {
-    color: 0x6e7060, roughness: 0.80, metalness: 0.0, envMapIntensity: 0.55,
-    wearStrength: 0.6,
+    color: 0x413d30, roughness: 0.80, metalness: 0.0, envMapIntensity: 0.55,
+    wearStrength: 0.5, macroStrength: 0.20,
   }));
   const mRub = vc(materials.get('rubber', {
     color: 0x24241f, roughness: 0.95, metalness: 0, envMapIntensity: 0.4,
@@ -1408,18 +1505,20 @@ export function buildWeapon(id, materials) {
   // sky to become opaque milk in daylight.
   const mGlass = vc(materials.get('glass', {
     color: 0xa8c4d4, roughness: 0.06, opacity: 1.0, envMapIntensity: 0.55,
-    streakStrength: 0, grimeStrength: 0.25,
+    streakStrength: 0, grimeStrength: 0.25, side: THREE.FrontSide,
   }));
   // The reticle. Unlit and additive, because an emitter is not a surface: its
   // brightness must not depend on where the sun is. The colour is far above 1.0
   // so the core clips through the filmic curve and the falloff lands in bloom.
   const mGlow = new THREE.MeshBasicMaterial({
-    color: new THREE.Color().setRGB(11.0, 1.35, 0.42, THREE.LinearSRGBColorSpace),
+    color: new THREE.Color().setRGB(7.5, 0.95, 0.30, THREE.LinearSRGBColorSpace),
     vertexColors: true,
     transparent: true,
     blending: THREE.AdditiveBlending,
     depthWrite: false,
-    side: THREE.DoubleSide,
+    // Single sided on purpose: a double-sided additive disc is drawn twice and
+    // the dot comes out at double the brightness it was authored at.
+    side: THREE.FrontSide,
     fog: false,
   });
   mGlow.name = 'mat:reticle';
@@ -1433,22 +1532,22 @@ export function buildWeapon(id, materials) {
   receiver.name = 'receiver';
   group.add(receiver);
   for (const m of [
-    meshFrom(B.coat, mCoat, 22, 'body:coated', SEAMS),
-    meshFrom(B.bare, mBare, 30, 'body:bare', SEAMS),
-    meshFrom(B.poly, mPoly, 11, 'body:polymer', SEAMS),
-    meshFrom(B.rub, mRub, 20, 'body:rubber', SEAMS),
-    meshFrom(B.glove, mGlove, 14, 'body:gloves', SEAMS),
-    meshFrom(B.glass, mGlass, 4, 'sight:pane', null),
-    meshFrom(B.glow, mGlow, 4, 'sight:reticle', null),
+    meshFrom(B.coat, mCoat, UV.coat, 'body:coated', SEAMS),
+    meshFrom(B.bare, mBare, UV.bare, 'body:bare', SEAMS),
+    meshFrom(B.poly, mPoly, UV.poly, 'body:polymer', SEAMS),
+    meshFrom(B.rub, mRub, UV.rub, 'body:rubber', SEAMS),
+    meshFrom(B.glove, mGlove, UV.glove, 'body:gloves', SEAMS),
+    meshFrom(B.glass, mGlass, UV.clear, 'sight:pane', null),
+    meshFrom(B.glow, mGlow, UV.clear, 'sight:reticle', null),
   ]) if (m) receiver.add(m);
 
   // Independently animated parts, each on the pivot that matches its motion:
   // bolt and charging handle slide on +Z, the magazine drops and rotates about
   // its front lip, the trigger rotates about its top pin.
-  const bolt = pivotFrom(B.bolt, 0, BORE_Y, -0.085, mBare, 30, 'bolt', SEAMS);
-  const mag = pivotFrom(B.mag, 0, -0.020, -0.076, mPoly, 11, 'mag', SEAMS);
-  const trigger = pivotFrom(B.trig, 0, -0.048, -0.008, mCoat, 22, 'trigger', SEAMS);
-  const charging = pivotFrom(B.chg, 0, 0.0033, -0.030, mBare, 30, 'charging', SEAMS);
+  const bolt = pivotFrom(B.bolt, 0, BORE_Y, -0.085, mBare, UV.bare, 'bolt', SEAMS);
+  const mag = pivotFrom(B.mag, 0, -0.020, -0.076, mPoly, UV.poly, 'mag', SEAMS);
+  const trigger = pivotFrom(B.trig, 0, -0.048, -0.008, mCoat, UV.coat, 'trigger', SEAMS);
+  const charging = pivotFrom(B.chg, 0, 0.0033, -0.030, mBare, UV.bare, 'charging', SEAMS);
   group.add(bolt, mag, trigger, charging);
 
   // Static handles. Correct world transforms for anything wanting to hang an
@@ -1464,7 +1563,7 @@ export function buildWeapon(id, materials) {
   const barrel = mk('barrel', 0, BORE_Y, (-0.088 + barrelEnd) / 2, receiver);
   const muzzle = mk('muzzle', 0, BORE_Y, barrelEnd - s.brakeLen / 2, receiver);
   const foregrip = mk('foregrip', 0, BORE_Y, HG_Z - s.hgLen / 2, receiver);
-  const stock = mk('stock', 0, -0.012, 0.090 + s.stockLen * 0.6, receiver);
+  const stock = mk('stock', 0, -0.012, NEAR_ZR + 0.023 + s.stockLen * 0.6, receiver);
   const optic = mk('optic', 0, SIGHT_Y, OPTIC_Z, receiver);
 
   const muzzleTip = mk('muzzleTip', 0, BORE_Y, barrelEnd - s.brakeLen - 0.002, group);

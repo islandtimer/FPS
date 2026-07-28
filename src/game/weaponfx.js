@@ -36,19 +36,21 @@
 // rest position is not a hand-tuned constant — it is solved at construction from
 // the optic's actual transform, so the reticle centres itself if the art moves.
 //
-// REST POSE. The rig sits about 11cm from the eye at the rear of the receiver
-// and 71cm at the muzzle, which is close enough that the near end is cropped by
-// the right and bottom edges of frame and its 0.5mm chamfers are two pixels
-// wide. That crop is the point: a viewmodel that fits entirely inside the frame
-// reads as a prop on a table, because nothing in the shot is nearer than arm's
-// length. Three angles do the rest of the work — 4.9 degrees of muzzle rise,
-// 4.3 degrees of inward yaw and 8.9 degrees of cant on top of the 2 degrees the
-// art bakes in — so the receiver presents its top deck and right flank at once
-// instead of the head-on sliver you get from a rig parallel to the view axis.
-// Because the body is now ~1.9x nearer than it was, every positional offset in
-// the module subtends ~1.9x the screen angle it was tuned at; NEAR_COMP scales
-// the whole offset sum back so sway, bob, lag and kick keep their tuned angular
-// amplitude rather than doubling.
+// REST POSE. The rig sits 11cm from the eye at the rear of the receiver and
+// 71cm at the muzzle, so the near end is cropped by the right and bottom edges
+// of frame and a 1.4mm chamfer on it is seven pixels wide at 1080p. The crop is
+// the point: a viewmodel that fits entirely inside the frame reads as a prop on
+// a table, because nothing in the shot is nearer than arm's length. Before this
+// the body was neither in the quadrant nor out of it — the magazine and grip
+// fell below the bottom edge while the barrel ran across the middle of frame,
+// which is the worst of both. Three angles do the rest — 4.9 degrees of muzzle
+// rise, 4.3 degrees of inward yaw and 8.9 degrees of cant on top of the 2 the
+// art bakes in — so the receiver presents its top deck and its right flank at
+// once instead of the head-on sliver a rig parallel to the view axis gives you.
+// The mass of the gun is ~1.4x nearer than it was, so every positional offset in
+// the module subtends ~1.4x the screen angle it was tuned at; NEAR_COMP scales
+// the whole offset sum back, in one place, so sway, bob, lag and kick keep the
+// angular amplitude they were tuned to have.
 //
 // ADS is a fast eased transition plus real FOV compression, not a lerp. The
 // blend parameter is integrated with a rate that is a power of the remaining
@@ -85,8 +87,8 @@ const HIP_POS = [0.176, -0.115, -0.178];
 const HIP_RX = 0.085;   // muzzle up
 const HIP_RY = 0.075;   // muzzle inboard, toward the centre line
 const HIP_RZ = 0.155;   // cant: top deck rolled toward the middle of frame
-// Positional offsets were tuned when the body sat ~1.9x further from the eye.
-const NEAR_COMP = 0.68;
+// Positional offsets were tuned when the body sat ~1.4x further from the eye.
+const NEAR_COMP = 0.72;
 // Linear magnification at full ADS. The base frustum is 80 degrees vertical,
 // which is very wide, so a red dot has to take a real bite out of it to read as
 // aimed at all.
@@ -94,9 +96,10 @@ const ADS_ZOOM = 1.50;
 // The ADS blend leaves rest at full speed and decelerates in (see header).
 const ADS_IN_P = 2.6;
 const ADS_OUT_P = 1.8;
-// A dry magazine rolls into a reload after this long — enough for the last
-// flash and the bolt locking back to be seen, short enough to feel automatic.
-const AUTO_RELOAD_DELAY = 0.14;
+// A dry magazine rolls into a reload after this long — six frames, enough for
+// the last flash and the bolt locking back to read as the reason the gun
+// stopped, short enough that it never feels like a hang.
+const AUTO_RELOAD_DELAY = 0.10;
 
 // Spring slots. One flat bank, indices instead of objects, so `step()` is a
 // single loop with no property lookups per element.
@@ -266,6 +269,10 @@ export class ViewModel {
     this._prevYaw = player.yaw || 0;
     this._prevPitch = player.pitch || 0;
     this._yawVel = 0; this._pitchVel = 0;
+    // Teleport detection (see _rePose). Both start where the player does, so the
+    // first frame is never mistaken for a jump.
+    this._lastPos = new THREE.Vector3().copy(this._playerPos());
+    this._trigAt = new THREE.Vector3().copy(this._lastPos);
 
     // ------------------------------------------------------------ springs
     const s = new SpringBank(SP.N);
@@ -341,8 +348,69 @@ export class ViewModel {
     if (v && !this.firing) { this._triggerEdge = true; this._burst = 0; }
     if (!v) { this._shotIndex = 0; }   // pattern resets on trigger release
     this.firing = v;
+    // Where the trigger was pressed, so a discontinuity in the player's position
+    // can tell a trigger held across it from one pressed after it. See _rePose.
+    if (v) this._trigAt.copy(this._playerPos());
     this._idle = 0;
     this._inspectT = -1;
+  }
+
+  _playerPos() {
+    const p = this.player.pos;
+    return p && p.isVector3 ? p : this.camera.position;
+  }
+
+  /**
+   * The player has moved discontinuously: a respawn, or the screenshot harness
+   * re-posing for the next shot. Nothing mid-flight survives the cut. A reload
+   * belonging to the place we just left, recoil the camera is still carrying, a
+   * magazine drained on the other side of the jump and a trigger that was held
+   * down before it are all state about a moment that no longer exists — carried
+   * across, they show up as a gun that is aiming somewhere the camera is not.
+   *
+   * The trigger is the delicate one: the harness sets a pose and *then* holds the
+   * trigger for its combat shot, so a press that happened at the destination is
+   * kept and one that happened before the jump is let go.
+   */
+  _rePose() {
+    const pl = this.player;
+    const pos = this._playerPos();
+    if (this.reloading) this._cancelReload();
+    if (this.firing && this._trigAt.distanceToSquared(pos) > 1) this.triggerDown(false);
+
+    this.ammo = this.cfg.magSize;
+    this.reserve = this.cfg.reserve;
+    this._autoReload = -1;
+    this._cool = 0; this._shotIndex = 0; this._heat = 0; this._bloom = 0;
+    this._sinceShot = 99; this._burst = 0; this._triggerEdge = false;
+    this._boltCycle = 1; this._chargeT = 0; this._muzzleFlash = 0; this._trigPull = 0;
+    this._idle = 0; this._inspectT = -1; this._lowReady = 0; this._raise = 0;
+    this._bobAmp = 0; this._bobPhase = 0; this._sprintT = 0;
+
+    // Recoil bookkeeping is dropped rather than handed back: the camera has just
+    // been re-aimed, so there is nothing left to recover toward.
+    this._camRecP = 0; this._camRecY = 0; this._camPermP = 0; this._camPermY = 0;
+    this._camAppP = 0; this._camAppY = 0;
+    this._shakeAmp = 0; this._shakeP = 0; this._shakeY = 0;
+
+    // A re-aim is not a look input. Latch the new angles before the angular
+    // velocity is measured, or the whole turn arrives as one 14rad/s spike and
+    // the gun swings off frame for half a second.
+    this._prevYaw = pl.yaw || 0; this._prevPitch = pl.pitch || 0;
+    this._yawVel = 0; this._pitchVel = 0;
+
+    // Springs to rest, so the first frame after the cut is a settled pose.
+    const s = this._s;
+    for (let i = 0; i < SP.N; i++) { s.x[i] = 0; s.v[i] = 0; }
+    s.x[SP.ADS] = this._adsRaw;
+
+    // Restart the idle clock and the sub-step accumulator. Every idle term is a
+    // bare sine of _t, so a pose re-entered at t=0 and advanced a fixed number of
+    // frames lands in exactly the same sway phase every time — which is what
+    // makes a screenshot comparable with the same screenshot from last round.
+    // Left running, the phase depends on however long the page happened to be
+    // rendering beforehand.
+    this._t = 0; this._acc = 0; this._shakePh = 0;
   }
 
   setAds(v) {
@@ -395,6 +463,14 @@ export class ViewModel {
 
     const pl = this.player;
     const cfg = this.cfg;
+
+    // --- discontinuity check first, before anything reads a delta. 1.5m in one
+    // frame is half again what a sprint plus a long fall can produce at the
+    // slowest dt the loop allows, so this only ever fires on a real teleport:
+    // a respawn, or the harness re-posing between shots.
+    const ppos = this._playerPos();
+    if (this._lastPos.distanceToSquared(ppos) > 2.25) this._rePose();
+    this._lastPos.copy(ppos);
 
     // --- stance, read defensively: player.js may express crouch as 0..1 or bool
     const crouch = typeof pl.crouch === 'number' ? sat(pl.crouch) : (pl.crouch ? 1 : 0);
@@ -567,9 +643,13 @@ export class ViewModel {
     if (!wants) return;
     if (this.ammo <= 0) {
       // Pulling on an empty magazine with rounds left in reserve is a request to
-      // reload, not a request to hear a click. Skips the delay the auto path
-      // uses: the player has already told us what they want.
-      if (this.reserve > 0) { this._autoReload = -1; this.reload(); return; }
+      // reload, not a request to hear a click. If the round that emptied the mag
+      // has already armed the auto path, let its short beat play out — the bolt
+      // locking back is the feedback that says *why* the gun stopped.
+      if (this.reserve > 0) {
+        if (this._autoReload < 0) this.reload();
+        return;
+      }
       // Genuinely out. Dry fire: the trigger still moves and the click is worth
       // hearing.
       if (mode !== 'auto' || this._cool <= -0.12) {
@@ -936,10 +1016,10 @@ export class ViewModel {
     this._pos.sub(_tmp);
 
     // Everything from here is a small positional offset in metres, and the rest
-    // pose sits close enough to the eye that a millimetre is worth roughly twice
-    // the screen angle these numbers were tuned against. NEAR_COMP takes the
-    // angular amplitude back to the tuned value in one place, so the relative
-    // weighting of sway against bob against kick is untouched.
+    // pose sits near enough to the eye that a millimetre is worth ~1.4x the
+    // screen angle these numbers were tuned against. NEAR_COMP takes the angular
+    // amplitude back to the tuned value in one place, so the relative weighting
+    // of sway against bob against kick is untouched.
     this._pos.x += (s[SP.LAG_X] + swayX + bobX + spX + insX + rlX) * NEAR_COMP;
     this._pos.y += (s[SP.LAG_Y] + swayY + breathe + bobY + kickY + jolt + spY + lrY + insY
       + rlY + arcY - cr * 0.010) * NEAR_COMP;

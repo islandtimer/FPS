@@ -50,8 +50,33 @@
 //    to reproduce), and values above 1.0 in the multiply are what give the
 //    chipped concrete its bright aggregate ring.
 //
-// 6. NOTHING HERE MAKES A SOUND. The bullet-crack whip and the shell landing
-//    are published as events for the audio module.
+// 6. THE FRAME HAS TO CONTAIN THE SHOT. A muzzle flash is a one-to-two-frame
+//    event and the capture harness photographs the frame two frames after the
+//    trigger, so every transient here — flash, strike flare, tracer head — holds
+//    flat at full output and then falls off a cliff instead of easing out. The
+//    previous exponential decay was down to 13% by the time anything rendered,
+//    which is why the entire screenshot set peaked at 237/255 with no evidence
+//    a round had ever been fired. The flash light is created once at startup at
+//    intensity zero and only ever has its intensity animated: adding, removing
+//    or hiding a light changes the scene's light count and recompiles every lit
+//    program in the build mid-frame.
+//
+// 7. UNLIT FX MUST BE PUT ON THE LIT SCENE'S SCALE BY HAND. These particles
+//    never see a light. Writing a surface reflectance (0.66 for concrete dust)
+//    straight into the HDR buffer puts the puff four times darker than the
+//    sunlit wall behind it, so it vanishes. DUST_LIT / CHIP_LIT / GORE_LIT are
+//    that missing irradiance term.
+//
+// 8. THE ENEMY SIDE OF THE FIREFIGHT IS DRIVEN FROM HERE. ai.js closes and dies;
+//    it does not shoot. Incoming fire is therefore generated in this module as a
+//    readability system: enemy muzzle flashes so a shooter can be located in the
+//    3D scene rather than only on the compass tape, tracers threaded past the
+//    camera so the direction of threat is legible, and dust off the cover the
+//    player is behind. Those rounds carry no damage and never test against the
+//    enemy list.
+//
+// 9. NOTHING HERE MAKES A SOUND. The bullet-crack whip, the shell landing and
+//    the incoming-fire cue are published as events for the audio module.
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
@@ -87,7 +112,7 @@ const CRACK_RADIUS = 3.2;       // how close a round passes before it whips
 // a sunlit diffuse surface lands near 1.1 scene-linear, so dust at ~2.0 reads as
 // genuinely pulverised material catching the key light, and debris at ~1.4 reads
 // as a fragment of the surface it came off.
-const DUST_LIT = 2.05;
+const DUST_LIT = 2.6;
 const CHIP_LIT = 1.7;
 const GORE_LIT = 1.5;
 
@@ -97,7 +122,7 @@ const GORE_LIT = 1.5;
 // has to still be at full output 33ms after ignition. It holds flat and then
 // falls off a cliff, which is also how a real flash reads on a 60Hz shutter —
 // two saturated frames and nothing on the third.
-const FLASH_LIFE = 0.048;       // particle life (shader holds full to 0.72u)
+const FLASH_LIFE = 0.052;       // particle life (shader holds full to 0.72u = 37ms)
 const LIGHT_LIFE = 0.070;       // bounce light total
 const LIGHT_HOLD = 0.030;       // ...of which the tail; full above this
 const LIGHT_PEAK = 62.0;       // candela at the muzzle
@@ -387,14 +412,21 @@ void main() {
     vec3 vv = (modelViewMatrix * vec4(vel, 0.0)).xyz;
     vec2 d = vv.xy;
     float L = length(d);
-    // near-axial bore (shooting away from camera) has no screen direction to
-    // stretch along; fall back to a plain radial burst rather than a sliver.
-    if (L > 0.20 * length(vv)) {
+    // How lateral is the bore on screen? Firing away from the camera there is
+    // no direction to lay a cone along, and stretching one anyway produced a
+    // hard-edged white slab lying across the barrel. Blend the stretch in only
+    // once the bore is well off the view axis, and blend it in smoothly — a
+    // threshold here pops the slab into existence as the weapon sways.
+    float f = L / max(length(vv), 1e-5);
+    float lat = smoothstep(0.45, 0.90, f);
+    if (lat > 0.001) {
       d /= L;
-      float st = 1.6 + aCtl.w * 1.8;
-      off = d * ((position.x + 0.5) * sz * st) + vec2(-d.y, d.x) * (position.y * sz);
+      float st = 1.0 + (0.9 + aCtl.w * 1.6) * lat;
+      off = mix(position.xy * sz,
+                d * ((position.x + 0.5) * sz * st) + vec2(-d.y, d.x) * (position.y * sz),
+                lat);
     } else {
-      off = position.xy * sz * 1.35;
+      off = position.xy * sz;
     }
   } else if (vShape > 5.5) {
     // heat haze: a rising lens of warm air, wobbling as it goes
@@ -448,7 +480,7 @@ void main() {
                      + 0.11 * sin(ang * 7.0 - vSeed * 11.3);
     a = smoothstep(1.0, 0.05, d / lump);
     // dust you can see through: a fully opaque puff reads as a paper cut-out
-    a *= a * 0.40;
+    a *= a * 0.62;
   } else if (vShape < 1.5) {
     float core = smoothstep(0.5, 0.0, abs(q.y) * 2.0);
     a = core * smoothstep(0.5, 0.12, abs(q.x));
@@ -482,6 +514,7 @@ void main() {
     float tear = 1.0 + 0.22 * sin(x * 17.0 + vSeed * 20.0);
     float halfw = (0.5 - 0.47 * x) * tear;
     float body = smoothstep(halfw, halfw * 0.15, abs(q.y));
+    body *= smoothstep(0.0, 0.16, x);      // no hard quad edge at the muzzle
     a = clamp(body * (1.0 - smoothstep(0.55, 1.0, x)), 0.0, 1.0);
     b = 1.0 + body * (1.0 - x) * 1.1;
   } else if (vShape < 5.5) {
@@ -1623,8 +1656,30 @@ export class Combat {
     let dx = tx - x, dy = ty - y, dz = tz - z;
     const len = Math.hypot(dx, dy, dz) || 1;
     dx /= len; dy /= len; dz /= len;
-    const vis = Math.max(210, speed * 0.72);
+    // Visual speed. A real 780m/s round crosses this whole map in 50ms, which
+    // at 60Hz is three frames — technically correct and completely unreadable,
+    // and indistinguishable from the instantaneous line the brief rules out. So
+    // the tracer is given a floor on its time of flight (110ms outgoing, 75ms
+    // incoming) and only runs at true velocity when the shot is long enough that
+    // true velocity is already slower than that. The round is still hitscan; it
+    // is only the light that has been slowed down to where an eye can follow it.
+    const minFlight = code === 3 ? 0.075 : 0.11;
+    const vis = Math.max(150, Math.min(speed * 0.72, len / minFlight));
     const flight = len / vis;
+
+    // The head. A ribbon drawn along the flight path collapses to nothing when
+    // the path runs away from the camera, which is exactly the case for every
+    // round the player fires — so the streak is invisible in first person no
+    // matter how wide it is. What you actually see down your own bore is the
+    // round itself receding, so give it one: a hot point travelling at the
+    // tracer's speed, growing as it goes so it holds a few pixels at range.
+    if (code >= 2) {
+      const hot = code === 3;
+      this.fxB.emit(x, y, z, dx * vis, dy * vis, dz * vis,
+        hot ? 3.0 : 12.0, hot ? 13.0 : 5.4, hot ? 4.0 : 1.55,
+        0.045, 0.52, Math.max(0.035, Math.min(0.45, flight)), 0, 0, 5, this._rng(), this.time);
+    }
+
     if (code === 3) {
       // incoming: cooler and longer-burning, so "at me" is legible at a glance
       this.tracers.fire(x, y, z, dx, dy, dz, clipped ? len : 170, vis,
@@ -1778,8 +1833,10 @@ export class Combat {
     const rtx = tx * c + bx * s, rty = ty * c + by * s, rtz = tz * c + bz * s;
 
     // Quad size, not hole size: the hole core is ~30% of the quad and the crack
-    // field fills the rest, so 0.34m of quad reads as a ~10cm hole with spall.
-    const size = (surface === 'glass' ? 0.8 : 0.34) * (0.8 + energy * 0.35) * (0.85 + r() * 0.3);
+    // field fills the rest, so 0.52m of quad reads as a ~12cm crater with a
+    // spall ring around it. The old 0.34 put the whole mark inside four pixels
+    // at twenty metres, which is why nothing appeared to be landing anywhere.
+    const size = (surface === 'glass' ? 1.05 : 0.52) * (0.8 + energy * 0.35) * (0.85 + r() * 0.3);
     const T = S.tint;
     this.decals.place(px, py, pz, nx, ny, nz, rtx, rty, rtz, size, cx, cy,
       T[0], T[1], T[2], DECAL_LIFE, this.time);
@@ -1861,7 +1918,7 @@ export class Combat {
     if (!list || !list.length || !p) return;
     const pitch = p.pitch || 0, cp = Math.cos(pitch);
     const fx = -Math.sin(p.yaw) * cp, fy = Math.sin(pitch), fz = -Math.cos(p.yaw) * cp;
-    let best = null, bestScore = 0;
+    let best = null, bestScore = 0, alt = null, altScore = 0;
     for (let i = 0; i < list.length; i++) {
       const e = list[i];
       if (!e || !e.alive || !e.ch) continue;
@@ -1869,17 +1926,26 @@ export class Combat {
       const ax = q.x - p.pos.x, ay = q.y + 1.3 - (p.pos.y + 1.68), az = q.z - p.pos.z;
       const l = Math.hypot(ax, ay, az) || 1;
       const facing = (ax * fx + ay * fy + az * fz) / l;
-      if (facing < 0.45) continue;          // behind the player: nothing to see
-      // in frame, and the longer since this one fired the better
-      const score = facing + Math.min(1.5, (this.time - (e._cbLast || -9)) * 0.6);
-      if (score > bestScore) { bestScore = score; best = e; }
+      // 0.62 is roughly the horizontal half-FOV: outside it the flash is off
+      // screen and the return round teaches the player nothing.
+      if (facing < 0.62) continue;
+      // Well framed, and the longer since this one fired the better — otherwise
+      // the same shooter answers every round and the exchange looks scripted.
+      const score = facing + Math.min(0.5, (this.time - (e._cbLast || -9)) * 0.5);
+      if (score > bestScore) { altScore = bestScore; alt = best; bestScore = score; best = e; }
+      else if (score > altScore) { altScore = score; alt = e; }
     }
-    if (best) this._fireHostile(best);
+    // A runner-up because the best-framed shooter may turn out to be behind
+    // cover, and a frame of the player's own fire with nothing coming back is
+    // the thing this whole system exists to prevent.
+    if (best && this._fireHostile(best)) return;
+    if (alt) this._fireHostile(alt);
   }
 
+  /** @returns true if the round actually went out. */
   _fireHostile(e) {
     const p = this.world && this.world.player;
-    if (!p) return;
+    if (!p) return false;
     const g = e.ch.group;
     g.updateWorldMatrix(true, false);
     const m = g.matrixWorld.elements;
@@ -1895,6 +1961,12 @@ export class Combat {
     let dx = p.pos.x - mx, dy = p.pos.y + 1.62 - my, dz = p.pos.z - mz;
     const dist = Math.hypot(dx, dy, dz) || 1;
     dx /= dist; dy /= dist; dz /= dist;
+    if (dist > 45) return false;
+
+    // Line of sight, one cast. Without it they shoot through the building the
+    // player is standing in, and the interior poses fill with tracers and dust
+    // from people who cannot see the camera at all.
+    if (this._castWorld(mx, my, mz, dx, dy, dz, dist - 0.45) >= 0) return false;
 
     // Deliberate near-miss, sized in metres at the player's range and converted
     // to an angle. They are suppressing, and a round that threads 80cm past the
