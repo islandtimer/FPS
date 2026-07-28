@@ -106,7 +106,7 @@ async function main() {
 
   // ---- 1. CPU probe (tiny framebuffer => fragment cost ≈ 0) --------------
   console.log('› cpu probe (320x180, 600 frames)…');
-  await page.goto(url('w=320&h=180&shot=firefight'), { waitUntil: 'domcontentloaded' });
+  await page.goto(url('w=320&h=180&shot=firefight'), { waitUntil: 'commit' });
   await waitReady();
   const cpu = await page.evaluate(async () => {
     const g = window.__game;
@@ -137,7 +137,7 @@ async function main() {
 
   // ---- 2. SwiftShader 1080p relative fps --------------------------------
   console.log('› swiftshader 1080p probe…');
-  await page.goto(url('w=1920&h=1080&shot=firefight'), { waitUntil: 'domcontentloaded' });
+  await page.goto(url('w=1920&h=1080&shot=firefight'), { waitUntil: 'commit' });
   await waitReady();
   const sw = await page.evaluate(async () => {
     for (let i = 0; i < 20; i++) await new Promise(requestAnimationFrame);
@@ -156,14 +156,21 @@ async function main() {
     ? shotNames
     : await page.evaluate(() => Object.keys(window.__game.shots));
 
+  // One page load for the whole contact sheet, re-posing between frames. Reloading
+  // per shot meant paying procedural scene init eight times, and under SwiftShader
+  // that init blocks DOMContentLoaded past any sane navigation timeout.
+  await page.goto(url('w=1920&h=1080'), { waitUntil: 'commit' });
+  await waitReady();
+
   for (const name of names) {
    try {
     process.stdout.write(`› shot ${name}… `);
-    await page.goto(url(`w=1920&h=1080&shot=${name}`), { waitUntil: 'domcontentloaded' });
-    await waitReady();
+    await page.evaluate((n) => window.__game.applyShot(n), name);
+    // Let temporal accumulation (TAA history, eye adaptation) converge on the new
+    // pose, or every frame is judged mid-transition.
     await page.evaluate(() => new Promise((r) => {
       let n = 0;
-      const tick = () => (++n < 24 ? requestAnimationFrame(tick) : r());
+      const tick = () => (++n < 40 ? requestAnimationFrame(tick) : r());
       requestAnimationFrame(tick);
     }));
     const file = join(outDir, `${name}.png`);
