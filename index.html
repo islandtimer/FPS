@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>OPERATION BLACKSAND</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#05070a;
+    font-family: ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, monospace; }
+  #view { position:fixed; inset:0; display:block; width:100%; height:100%; touch-action:none; }
+  #ui { position:fixed; inset:0; pointer-events:none; overflow:hidden; }
+  #ui .clickable { pointer-events:auto; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="ui"></div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
