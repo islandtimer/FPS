@@ -109,7 +109,7 @@ addEventListener('resize', resize);
 resize();
 
 // ---------------------------------------------------------------- bench hooks
-const benchState = { paused: false, fixedDt: 1 / 60, frames: 0 };
+const benchState = { paused: false, fixedDt: 1 / 60, frames: 0, halted: false, raf: 0 };
 window.__game = {
   perf, scene, camera, player, viewmodel, director, enemies, level, pipeline,
   shots: CAMERA_SHOTS,
@@ -126,6 +126,30 @@ window.__game = {
   step(n = 1, dt = 1 / 60) { for (let i = 0; i < n; i++) step(dt); },
   snapshot: () => perf.snapshot(1920, 1080),
   setPaused(v) { benchState.paused = v; },
+
+  // Screenshot support. Capturing while the canvas re-renders every frame means
+  // racing the compositor, which under a software rasteriser never settles. So the
+  // harness drives N frames to let temporal accumulation converge, halts the loop,
+  // captures a completely static surface, then resumes.
+  halt() {
+    benchState.halted = true;
+    if (benchState.raf) cancelAnimationFrame(benchState.raf);
+    benchState.raf = 0;
+  },
+  resume() {
+    if (!benchState.halted) return;
+    benchState.halted = false;
+    benchState.raf = requestAnimationFrame(frame);
+  },
+  /** Advance exactly n rendered frames at a fixed dt, then halt. */
+  settle(n = 40, dt = 1 / 60) {
+    this.halt();
+    for (let i = 0; i < n; i++) {
+      if (!benchState.paused) step(dt);
+      pipeline.render(scene, camera, dt);
+    }
+    pipeline.reportCost(perf);
+  },
 };
 
 // ---------------------------------------------------------------- self-benchmark
@@ -195,7 +219,7 @@ function step(dt) {
 }
 
 function frame(now) {
-  requestAnimationFrame(frame);
+  benchState.raf = requestAnimationFrame(frame);
   const raw = perf.beginFrame(now);
   const dt = Math.min(0.05, raw / 1000) || 1 / 60;
   const t0 = performance.now();

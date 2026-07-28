@@ -164,14 +164,14 @@ async function main() {
   for (const name of names) {
    try {
     process.stdout.write(`› shot ${name}… `);
-    await page.evaluate((n) => window.__game.applyShot(n), name);
-    // Let temporal accumulation (TAA history, eye adaptation) converge on the new
-    // pose, or every frame is judged mid-transition.
-    await page.evaluate(() => new Promise((r) => {
-      let n = 0;
-      const tick = () => (++n < 40 ? requestAnimationFrame(tick) : r());
-      requestAnimationFrame(tick);
-    }));
+    await page.evaluate((n) => {
+      const g = window.__game;
+      g.applyShot(n);
+      // Drive a fixed number of rendered frames so temporal accumulation (TAA
+      // history, eye adaptation) converges, then stop rendering entirely — the
+      // capture below then reads a static surface instead of racing the compositor.
+      g.settle(48, 1 / 60);
+    }, name);
     const file = join(outDir, `${name}.png`);
     await page.screenshot({ path: file, timeout: 180000, caret: 'initial' });
     // A 960px JPEG alongside the archival PNG: this is what the progress page and
@@ -182,7 +182,9 @@ async function main() {
     result.shotsFull = result.shotsFull || {};
     result.shotsFull[name] = `shots/r${String(round).padStart(2, '0')}/${name}.png`;
     console.log('ok');
+    await page.evaluate(() => window.__game.resume());
    } catch (e) {
+    await page.evaluate(() => window.__game.resume()).catch(() => {});
     // One bad pose must not cost us the whole round's data.
     console.log('FAILED: ' + String(e.message).split('\n')[0]);
     errors.push(`shot ${name}: ${String(e.message).slice(0, 200)}`);
