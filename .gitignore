@@ -2,3 +2,8 @@ node_modules/
 dist/
 .build/
 *.log
+
+# Reference imagery is for looking at, never for shipping. Kept in the session
+# scratchpad, but belt-and-braces in case anything is ever dropped in the tree.
+ref/
+reference/

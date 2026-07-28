@@ -185,6 +185,15 @@ vec3 toRGB(vec3 c) {
 void main() {
   vec3 cur = texture2D(tCur, vUv).rgb;
 
+  // AO is folded in here so it accumulates temporally instead of shimmering.
+  // It has to scale the clip box too, or the box (built from un-occluded
+  // neighbours) would keep yanking the darkened history back up.
+  float aoF = 1.0;
+#ifdef USE_AO
+  aoF = mix(1.0, texture2D(tAO, vUv).r, uAoStrength);
+#endif
+  cur *= aoF;
+
   // 3x3 neighbourhood in YCoCg: mean/variance gives a much tighter clip volume
   // than min/max, which is the difference between "stable" and "smeary".
   vec3 m1 = vec3(0.0), m2 = vec3(0.0);
@@ -196,15 +205,12 @@ void main() {
       nmin = min(nmin, s); nmax = max(nmax, s);
     }
   }
-  vec3 mean = m1 / 9.0;
-  vec3 sigma = sqrt(max(vec3(0.0), m2 / 9.0 - mean * mean));
+  // YCoCg is linear in RGB, so the whole box scales by the AO factor.
+  vec3 mean = (m1 / 9.0) * aoF;
+  vec3 sigma = sqrt(max(vec3(0.0), m2 / 9.0 - (m1 / 9.0) * (m1 / 9.0))) * aoF;
+  nmin *= aoF; nmax *= aoF;
   vec3 lo = max(nmin, mean - 1.25 * sigma);
   vec3 hi = min(nmax, mean + 1.25 * sigma);
-
-#ifdef USE_AO
-  float ao = texture2D(tAO, vUv).r;
-  cur *= mix(1.0, ao, uAoStrength);
-#endif
 
   // Closest-of-5 depth so thin edges reproject with the foreground, not the
   // background sliding out from behind them.
@@ -621,6 +627,14 @@ export class RenderPipeline {
     this._adaptIndex = 0;
     this._shadowTexels = 0;
     this._shadowScanAt = -1e9;
+    this._scanAcc = 0;
+    // Hoisted so the throttled scan allocates no closure.
+    this._countShadow = (o) => {
+      if (o.isLight && o.castShadow && o.shadow) {
+        const m = o.shadow.mapSize;
+        this._scanAcc += m.x * m.y * (o.isPointLight ? 6 : 1);
+      }
+    };
     this._passCost = 1;
 
     this._jitter = [];
@@ -1096,14 +1110,9 @@ export class RenderPipeline {
   _scanShadows(scene) {
     this._shadowScanAt = this._frame;
     if (!this.renderer.shadowMap.enabled) { this._shadowTexels = 0; return; }
-    let texels = 0;
-    scene.traverse((o) => {
-      if (o.isLight && o.castShadow && o.shadow) {
-        const m = o.shadow.mapSize;
-        texels += m.x * m.y * (o.isPointLight ? 6 : 1);
-      }
-    });
-    this._shadowTexels = texels;
+    this._scanAcc = 0;
+    scene.traverse(this._countShadow);
+    this._shadowTexels = this._scanAcc;
   }
 
   reportCost(perf) {
