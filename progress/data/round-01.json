@@ -1,0 +1,194 @@
+{
+  "round": 1,
+  "label": "wave 1: all eight modules",
+  "ts": "2026-07-28T14:21:14.710Z",
+  "shots": {
+    "establish": "shots/r01/establish.jpg",
+    "interior": "shots/r01/interior.jpg",
+    "hipfire": "shots/r01/hipfire.jpg",
+    "ads": "shots/r01/ads.jpg",
+    "firefight": "shots/r01/firefight.jpg",
+    "material_detail": "shots/r01/material_detail.jpg",
+    "silhouette": "shots/r01/silhouette.jpg"
+  },
+  "errors": [
+    "shot street: page.screenshot: Timeout 180000ms exceeded.\nCall log:\n\u001b[2m  - taking page screenshot\u001b[22m\n\u001b[2m  - waiting for fonts to load...\u001b[22m\n\u001b[2m  - fonts loaded\u001b[22m\n"
+  ],
+  "perf": {
+    "cpu": {
+      "logicMedian": 0,
+      "logicP95": 0.1,
+      "logicP99": 0.5,
+      "logicMax": 3,
+      "stats": {
+        "calls": 97,
+        "triangles": 341410,
+        "programs": 26,
+        "textures": 55,
+        "geometries": 55
+      },
+      "budgets": {
+        "rows": [
+          {
+            "k": "drawCalls",
+            "v": 97,
+            "limit": 260,
+            "ok": true
+          },
+          {
+            "k": "triangles",
+            "v": 341410,
+            "limit": 950000,
+            "ok": true
+          },
+          {
+            "k": "fullscreenPasses",
+            "v": 3.199,
+            "limit": 8,
+            "ok": true
+          },
+          {
+            "k": "shadowTexelsM",
+            "v": 8.4,
+            "limit": 14,
+            "ok": true
+          },
+          {
+            "k": "logicMs",
+            "v": 0.25,
+            "limit": 4,
+            "ok": true
+          },
+          {
+            "k": "programs",
+            "v": 26,
+            "limit": 90,
+            "ok": true
+          }
+        ],
+        "pass": true
+      },
+      "estimate": {
+        "m1": {
+          "name": "Apple M1 (8c GPU)",
+          "fragMs": 3.21,
+          "shadowMs": 0.68,
+          "triMs": 0.21,
+          "drawCpuMs": 0.68,
+          "estMs": 4.1,
+          "estFps": 244
+        },
+        "gtx1660": {
+          "name": "GTX 1660",
+          "fragMs": 1.78,
+          "shadowMs": 0.37,
+          "triMs": 0.11,
+          "drawCpuMs": 0.87,
+          "estMs": 2.26,
+          "estFps": 443
+        }
+      }
+    },
+    "swiftshader1080p": {
+      "fps": 0.3,
+      "note": "CPU rasteriser — relative regression signal only"
+    },
+    "snapshot": {
+      "wallFps": 0.3,
+      "onePercentLowFps": 0.1,
+      "logicMs": 0.562,
+      "cpuMs": 0.5,
+      "gpuSubmitMs": 1.7,
+      "renderScale": 1,
+      "quality": "high",
+      "stats": {
+        "calls": 85,
+        "triangles": 337990,
+        "programs": 26,
+        "textures": 56,
+        "geometries": 49
+      },
+      "pipelineCost": {
+        "fullscreenPasses": 3.166,
+        "shadowTexels": 8388608,
+        "overdraw": 1.6
+      },
+      "budgets": {
+        "rows": [
+          {
+            "k": "drawCalls",
+            "v": 85,
+            "limit": 260,
+            "ok": true
+          },
+          {
+            "k": "triangles",
+            "v": 337990,
+            "limit": 950000,
+            "ok": true
+          },
+          {
+            "k": "fullscreenPasses",
+            "v": 3.166,
+            "limit": 8,
+            "ok": true
+          },
+          {
+            "k": "shadowTexelsM",
+            "v": 8.4,
+            "limit": 14,
+            "ok": true
+          },
+          {
+            "k": "logicMs",
+            "v": 0.56,
+            "limit": 4,
+            "ok": true
+          },
+          {
+            "k": "programs",
+            "v": 26,
+            "limit": 90,
+            "ok": true
+          }
+        ],
+        "pass": true
+      },
+      "estimate": {
+        "m1": {
+          "name": "Apple M1 (8c GPU)",
+          "fragMs": 3.19,
+          "shadowMs": 0.68,
+          "triMs": 0.21,
+          "drawCpuMs": 0.59,
+          "estMs": 4.08,
+          "estFps": 245
+        },
+        "gtx1660": {
+          "name": "GTX 1660",
+          "fragMs": 1.76,
+          "shadowMs": 0.37,
+          "triMs": 0.11,
+          "drawCpuMs": 0.77,
+          "estMs": 2.24,
+          "estFps": 445
+        }
+      }
+    }
+  },
+  "shotsFull": {
+    "establish": "shots/r01/establish.png",
+    "interior": "shots/r01/interior.png",
+    "hipfire": "shots/r01/hipfire.png",
+    "ads": "shots/r01/ads.png",
+    "firefight": "shots/r01/firefight.png",
+    "material_detail": "shots/r01/material_detail.png",
+    "silhouette": "shots/r01/silhouette.png"
+  },
+  "verdict": {
+    "budgetsPass": true,
+    "cpuOk": true,
+    "pass": true,
+    "failing": []
+  }
+}

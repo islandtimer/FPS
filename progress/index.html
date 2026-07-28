@@ -57,5 +57,65 @@ dialog form{padding:9px;text-align:center;background:#12161c}
 dialog button{background:#232b36;color:var(--ink);border:0;padding:8px 20px;border-radius:6px;font:inherit}
 </style></head><body><header><div class="wrap">
     <h1>OPERATION <span>BLACKSAND</span></h1>
-    <div class="sub">PROCEDURAL FPS · THREE.JS · BUILD LOG</div>
-  </div></header><div class="wrap"><div class="card"><h2>no rounds yet</h2><p class="dim">Run <code>node tools/bench.mjs</code>.</p></div></div></body></html>
+    <div class="sub">PROCEDURAL FPS · THREE.JS · BUILD LOG · ROUND 1 · 2026-07-28 14:21Z</div>
+  </div></header><div class="wrap"><div class="grid">
+    <div class="stat"><div class="k">M1 est. fps</div><div class="v ok">244</div><div class="n">1080p · cost model</div></div>
+    <div class="stat"><div class="k">GTX 1660 est. fps</div><div class="v ok">443</div><div class="n">1080p · cost model</div></div>
+    <div class="stat"><div class="k">logic p95</div><div class="v ok">0.10ms</div><div class="n">measured · limit 4.00ms</div></div>
+    <div class="stat"><div class="k">draw calls</div><div class="v ok">97</div><div class="n">limit 260</div></div>
+    <div class="stat"><div class="k">triangles</div><div class="v ok">341k</div><div class="n">limit 950k</div></div>
+    <div class="stat"><div class="k">perf gate</div><div class="v ok">PASS</div><div class="n">all budgets</div></div>
+  </div><div class="note"><b>How the fps numbers are produced.</b> The build container has
+    <b>no GPU</b> — Chromium falls back to SwiftShader, a CPU rasteriser — so raw frame rate measured
+    here would be meaningless for an M1 or a GTX 1660. Instead every round measures what actually
+    transfers: JS logic time per frame, draw calls, triangles, fullscreen passes and shadow texels,
+    all against fixed budgets, converted to an <b>estimated</b> ms/frame using published throughput
+    figures for both reference GPUs. SwiftShader's own 1080p rate is recorded purely as a
+    round-over-round regression signal (<b>0.3 fps</b> software).
+    The game ships a live fps counter and an in-game benchmark, so the real number on real hardware is one keypress away.</div><div class="card"><h2>frame budget · 1920×1080</h2><table>
+    <tr><th>metric</th><th class="num">value</th><th class="num">limit</th><th class="num">headroom</th></tr><tr><td>drawCalls</td><td class="num ok">97</td>
+      <td class="num dim">260</td><td class="num">
+      <div class="bar"><i style="width:37.30769230769231%;background:#4ec97f"></i></div></td></tr><tr><td>triangles</td><td class="num ok">341410</td>
+      <td class="num dim">950000</td><td class="num">
+      <div class="bar"><i style="width:35.93789473684211%;background:#4ec97f"></i></div></td></tr><tr><td>fullscreenPasses</td><td class="num ok">3.199</td>
+      <td class="num dim">8</td><td class="num">
+      <div class="bar"><i style="width:39.9875%;background:#4ec97f"></i></div></td></tr><tr><td>shadowTexelsM</td><td class="num ok">8.4</td>
+      <td class="num dim">14</td><td class="num">
+      <div class="bar"><i style="width:60%;background:#4ec97f"></i></div></td></tr><tr><td>logicMs</td><td class="num ok">0.25</td>
+      <td class="num dim">4</td><td class="num">
+      <div class="bar"><i style="width:6.25%;background:#4ec97f"></i></div></td></tr><tr><td>programs</td><td class="num ok">26</td>
+      <td class="num dim">90</td><td class="num">
+      <div class="bar"><i style="width:28.888888888888886%;background:#4ec97f"></i></div></td></tr></table></div><div class="card"><h2>cost model · estimated ms per frame</h2><table>
+    <tr><th>gpu</th><th class="num">fragment</th><th class="num">shadow</th><th class="num">vertex</th>
+    <th class="num">draw cpu</th><th class="num">frame</th><th class="num">fps</th></tr><tr><td>Apple M1 (8c GPU)</td><td class="num">3.21</td><td class="num">0.68</td>
+      <td class="num">0.21</td><td class="num">0.68</td>
+      <td class="num">4.1</td><td class="num ok">244</td></tr><tr><td>GTX 1660</td><td class="num">1.78</td><td class="num">0.37</td>
+      <td class="num">0.11</td><td class="num">0.87</td>
+      <td class="num">2.26</td><td class="num ok">443</td></tr></table></div><details class="round" open><summary>
+      <span class="pill" style="color:#4ec97f">perf pass</span>
+      <b>ROUND 1</b>
+      <span class="dim">wave 1: all eight modules</span>
+      <span class="bignum">· 0.10ms logic · 97 calls
+      · est 244fps M1</span>
+    </summary><div class="body"><div class="shots" style="margin-top:13px"><div class="shot"><img loading="lazy" src="shots/r01/establish.jpg" alt="establish" data-full="shots/r01/establish.jpg">
+          <div class="cap"><b>ESTABLISH</b></div></div><div class="shot"><img loading="lazy" src="shots/r01/interior.jpg" alt="interior" data-full="shots/r01/interior.jpg">
+          <div class="cap"><b>INTERIOR</b></div></div><div class="shot"><img loading="lazy" src="shots/r01/hipfire.jpg" alt="hipfire" data-full="shots/r01/hipfire.jpg">
+          <div class="cap"><b>HIPFIRE</b></div></div><div class="shot"><img loading="lazy" src="shots/r01/ads.jpg" alt="ads" data-full="shots/r01/ads.jpg">
+          <div class="cap"><b>ADS</b></div></div><div class="shot"><img loading="lazy" src="shots/r01/firefight.jpg" alt="firefight" data-full="shots/r01/firefight.jpg">
+          <div class="cap"><b>FIREFIGHT</b></div></div><div class="shot"><img loading="lazy" src="shots/r01/material_detail.jpg" alt="material_detail" data-full="shots/r01/material_detail.jpg">
+          <div class="cap"><b>MATERIAL_DETAIL</b></div></div><div class="shot"><img loading="lazy" src="shots/r01/silhouette.jpg" alt="silhouette" data-full="shots/r01/silhouette.jpg">
+          <div class="cap"><b>SILHOUETTE</b></div></div></div><div class="note" style="margin-top:12px"><b>1 console errors</b><br>shot street: page.screenshot: Timeout 180000ms exceeded.
+Call log:
+[2m  - taking page screenshot[22m
+[2m  - waiting for fonts to load...[22m
+[2m  - fonts loaded[22m
+</div></div></details></div>
+<dialog id="lb"><img><form method="dialog"><button>close</button></form></dialog>
+<footer>All art, audio, meshes and textures in this project are generated procedurally in code.<br>
+No third-party game assets, audio, model names or trademarks are used.<br>
+Page regenerated by <code>tools/progress.mjs</code>.</footer>
+<script>
+const lb=document.getElementById('lb');
+document.addEventListener('click',e=>{const i=e.target.closest('.shot img');
+  if(i){lb.querySelector('img').src=i.dataset.full;lb.showModal();}});
+</script></body></html>

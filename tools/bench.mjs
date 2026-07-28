@@ -27,7 +27,6 @@ import { spawn } from 'node:child_process';
 const ROOT = resolve(import.meta.dirname, '..');
 const DIST = join(ROOT, 'dist');
 const CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
-const FFMPEG = '/opt/pw-browsers/ffmpeg-1011/ffmpeg-linux';
 const PORT = 4319;
 
 const args = process.argv.slice(2);
@@ -61,6 +60,34 @@ function run(cmd, cmdArgs, opts = {}) {
     const p = spawn(cmd, cmdArgs, { cwd: ROOT, stdio: 'inherit', ...opts });
     p.on('exit', (c) => (c === 0 ? res() : rej(new Error(`${cmd} exited ${c}`))));
   });
+}
+
+/**
+ * Downscale a PNG to a JPEG for the progress page and the phone artifact.
+ * Playwright's bundled ffmpeg is a video-only build with no PNG decoder and no
+ * image2 demuxer, so Chromium does the work instead — it already has both codecs.
+ */
+async function thumbnail(page, srcPath, dstPath, width) {
+  try {
+    const b64 = (await readFile(srcPath)).toString('base64');
+    const out = await page.evaluate(async ({ b64, width }) => {
+      const img = new Image();
+      img.src = 'data:image/png;base64,' + b64;
+      await img.decode();
+      const c = document.createElement('canvas');
+      c.width = width;
+      c.height = Math.round((img.height / img.width) * width);
+      const ctx = c.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      return c.toDataURL('image/jpeg', 0.74).split(',')[1];
+    }, { b64, width });
+    await writeFile(dstPath, Buffer.from(out, 'base64'));
+    return true;
+  } catch (e) {
+    console.log(`  (thumbnail failed: ${String(e.message).slice(0, 80)})`);
+    return false;
+  }
 }
 
 async function nextRound() {
@@ -104,6 +131,10 @@ async function main() {
   page.setDefaultNavigationTimeout(180000);
   page.on('pageerror', (e) => errors.push(String(e).slice(0, 400)));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text().slice(0, 400)); });
+
+  // A second, deliberately empty page used only as an image-resizing surface.
+  const thumbPage = await ctx.newPage();
+  await thumbPage.setContent('<!doctype html><title>thumb</title>');
 
   const url = (q) => `http://127.0.0.1:${PORT}/index.html?bench=1&${q}`;
   const waitReady = () => page.waitForFunction('window.__game && window.__game.ready', null, { timeout: 120000 });
@@ -177,14 +208,25 @@ async function main() {
       g.settle(48, 1 / 60);
     }, name);
     const file = join(outDir, `${name}.png`);
-    await page.screenshot({ path: file, timeout: 180000, caret: 'initial' });
-    // A 960px JPEG alongside the archival PNG: this is what the progress page and
-    // the phone-facing artifact embed, so the page stays light over many rounds.
-    await run(FFMPEG, ['-y', '-loglevel', 'error', '-i', file, '-vf', 'scale=960:-1',
-                       '-q:v', '5', join(outDir, `${name}.jpg`)]).catch(() => {});
-    result.shots[name] = `shots/r${String(round).padStart(2, '0')}/${name}.jpg`;
+    let captured = false;
+    for (let attempt = 0; attempt < 2 && !captured; attempt++) {
+      try {
+        await page.screenshot({ path: file, timeout: 150000, caret: 'initial' });
+        captured = true;
+      } catch (e) {
+        if (attempt === 1) throw e;
+        // Capture occasionally loses the race with the compositor. Nudge the page
+        // into producing a fresh frame and try once more before giving up the pose.
+        await page.evaluate(() => { window.__game.resume(); }).catch(() => {});
+        await page.waitForTimeout(2000);
+        await page.evaluate(() => window.__game.settle(8, 1 / 60)).catch(() => {});
+      }
+    }
+    await thumbnail(thumbPage, file, join(outDir, `${name}.jpg`), 960);
+    const dir = `shots/r${String(round).padStart(2, '0')}`;
+    result.shots[name] = `${dir}/${name}.jpg`;
     result.shotsFull = result.shotsFull || {};
-    result.shotsFull[name] = `shots/r${String(round).padStart(2, '0')}/${name}.png`;
+    result.shotsFull[name] = `${dir}/${name}.png`;
     console.log('ok');
     await page.evaluate(() => window.__game.resume());
    } catch (e) {
