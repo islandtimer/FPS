@@ -19,6 +19,13 @@
 // cost is well under 0.1ms/frame steady state, and the only frames that cost
 // more are the ones where something visibly moved.
 //
+// TWO TYPEFACES, ONE RULE. Monospace is the *debug* voice and nothing else: the
+// perf readout and the self-benchmark panel. Every number the player is meant to
+// read — ammo, reserve, health, score, compass bearings — is set in the narrow
+// technical face (TECH) at tabular figures, so ammo and health read as siblings
+// from the same instrument cluster and nothing shipped can be mistaken for
+// engine telemetry. The perf panel is hidden by default; SHIFT+F reveals it.
+//
 // NO WALL CLOCK. All animation is driven by the accumulated dt, never by
 // performance.now() and never by CSS keyframes. The bench harness calls step()
 // 900 times synchronously and screenshots after exactly three fixed steps; a
@@ -29,9 +36,20 @@
 // CRISPNESS. The reticle is the most scrutinised 40 pixels in the frame. Its
 // canvas backing store is sized to devicePixelRatio and everything is drawn in
 // integer device pixels as axis-aligned fillRects, so a tick is exactly N device
-// pixels wide with hard edges — no half-covered pixels, no CSS scaling blur. The
-// compass tape is pre-rendered once into an offscreen canvas and blitted at
-// integer offsets, so its glyphs are rasterised once and never resampled.
+// pixels wide with hard edges — no half-covered pixels, no CSS scaling blur. Both
+// canvases are positioned with an integer negative margin instead of a
+// translate(-50%), because a percentage translate on an odd-width box lands the
+// whole backing store on a half pixel and every 1px tick in it turns into two
+// half-lit ones. The compass tape is pre-rendered once into an offscreen canvas
+// at integer tick positions and blitted at integer offsets, so its glyphs are
+// rasterised once and never resampled.
+//
+// LIGHT ON DARK, EVERYWHERE. The HUD owns its own contrast: it never assumes the
+// world behind it is dark. The compass paints a soft dark scrim under itself and
+// draws light ticks on top of it (a per-tick black skirt was making a 1px tick
+// read as a 3px dark smudge against bright sky); the banner sits on a soft radial
+// scrim instead of a hard offset shadow; the reticle and hitmarker carry a
+// one-device-pixel near-black outline so they survive blown-out stucco.
 //
 // SPREAD IS READ, NOT INVENTED. weaponfx only recomputes .spread on the frame a
 // round leaves the barrel, so the reticle mirrors that module's spread model
@@ -39,6 +57,12 @@
 // by EV.SHOT) to get a value that is live every frame and agrees with the
 // weapon's on the frames where both exist. If the ballistics model changes, this
 // is the one block that has to follow it.
+//
+// ONE AUTHORITY FOR WAVE STATE. The director's live count is the only source of
+// the hostile number. The wave banner does not snapshot the count it was raised
+// with — it is re-written from the same string the objective strip uses, and the
+// objective strip fades out while the banner is up, so the two can never disagree
+// on screen and never print the same number twice.
 //
 // LAYERS. Everything that animates continuously (vignette, damage arcs, bars,
 // banner) animates via opacity/transform only, so the compositor handles it and
@@ -55,8 +79,13 @@ import { makeRng } from '../core/rng.js';
 const INK = '#eaf1f9';
 const WARM = '#ffb14a';
 const BAD = '#ff4a35';
-const SHADOW = 'rgba(0,0,0,0.60)';
+const OUTLINE = 'rgba(2,4,7,0.88)';   // reticle/hitmarker skirt — survives blown stucco
+// Debug voice. Used by the perf and benchmark panels and by nothing else.
 const MONO = 'ui-monospace,"SF Mono","Roboto Mono",Menlo,Consolas,monospace';
+// Shipped voice. A narrow technical sans; the stack degrades to whatever grotesk
+// the machine has, and the numerals are locked to tabular figures either way.
+const TECH = '"Roboto Condensed","Liberation Sans Narrow","Arial Narrow",' +
+  '"Helvetica Neue Condensed","Liberation Sans","DejaVu Sans",Arial,sans-serif';
 
 const DEG = 180 / Math.PI;
 const CARD = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
@@ -64,6 +93,10 @@ const CARD = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
 // Fictional call signs. Seeded so a killfeed screenshot reproduces round to round.
 const CALL_A = ['DUSK', 'ASHFALL', 'KITE', 'HOLLOW', 'SALTPAN', 'VEER', 'MIRE', 'TALLOW', 'GRAVEL', 'REEDS'];
 const PLAYER_CALLSIGN = 'RAVEN 1';
+
+// Kill flourish duration. Longer than the hitmarker on purpose — the ring is what
+// tells the player the target is down after the marker has already gone.
+const KILL_LIFE = 0.34;
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 const smooth = (v) => { const t = clamp01(v); return t * t * (3 - 2 * t); };
@@ -80,10 +113,12 @@ function mkEl(tag, cls, parent) {
 // The whole stylesheet, injected once with the HUD and removed with it. Class
 // names are prefixed so nothing can collide with another module's overlay.
 const CSS = `
-.hud{position:absolute;inset:0;color:${INK};font:12px/1 ${MONO};letter-spacing:.06em;
+.hud{position:absolute;inset:0;color:${INK};font:12px/1 ${TECH};letter-spacing:.06em;
   -webkit-font-smoothing:antialiased;text-rendering:optimizeSpeed}
 .hud .sh{text-shadow:0 1px 2px rgba(0,0,0,.95),0 0 10px rgba(0,0,0,.55)}
-.hud .fade{transition:none}
+/* Every player-facing figure: one face, tabular, slightly tightened. */
+.hud .num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;
+  font-weight:600;letter-spacing:.015em;display:inline-block}
 
 .hud-vig{position:absolute;inset:-2px;opacity:0;will-change:opacity;
   background:radial-gradient(ellipse 78% 72% at 50% 50%,rgba(0,0,0,0) 44%,rgba(96,8,4,.30) 74%,rgba(58,3,2,.78) 100%)}
@@ -92,27 +127,41 @@ const CSS = `
 .hud-edge{position:absolute;inset:0;opacity:0;will-change:opacity;
   background:radial-gradient(ellipse 92% 88% at 50% 50%,rgba(0,0,0,0) 58%,rgba(0,0,0,.55) 100%)}
 
-.hud-ret{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)}
+.hud-ret{position:absolute;left:50%;top:50%}
 
-.hud-arcs{position:absolute;left:50%;top:50%;width:460px;height:460px;margin:-230px 0 0 -230px}
+.hud-arcs{position:absolute;left:50%;top:50%;width:520px;height:520px;margin:-260px 0 0 -260px}
 .hud-arc{position:absolute;inset:0;opacity:0;will-change:transform,opacity;color:${BAD}}
 .hud-arc svg{width:100%;height:100%;display:block;overflow:visible}
 
-.hud-comp{position:absolute;left:50%;top:16px;transform:translateX(-50%);
-  -webkit-mask-image:linear-gradient(90deg,transparent,#000 11%,#000 89%,transparent);
-  mask-image:linear-gradient(90deg,transparent,#000 11%,#000 89%,transparent)}
-.hud-obj{position:absolute;left:50%;top:56px;transform:translateX(-50%);white-space:nowrap;
-  font-size:11px;opacity:.62;letter-spacing:.20em}
+.hud-comp{position:absolute;left:50%;top:14px;
+  -webkit-mask-image:linear-gradient(90deg,transparent 0,rgba(0,0,0,.35) 7%,#000 17%,#000 83%,rgba(0,0,0,.35) 93%,transparent 100%);
+  mask-image:linear-gradient(90deg,transparent 0,rgba(0,0,0,.35) 7%,#000 17%,#000 83%,rgba(0,0,0,.35) 93%,transparent 100%)}
+.hud-obj{position:absolute;left:50%;top:58px;transform:translateX(-50%);white-space:nowrap;
+  font-size:11px;opacity:.62;letter-spacing:.20em;text-shadow:0 1px 2px rgba(0,0,0,.9)}
 .hud-obj b{font-weight:600;color:${WARM};letter-spacing:.22em}
 .hud-obj i{display:inline-block;width:26px;height:1px;background:currentColor;opacity:.5;
   vertical-align:middle;margin:0 10px 2px}
+.hud-obj span{font-variant-numeric:tabular-nums}
 
-.hud-ban{position:absolute;left:50%;top:19%;transform:translateX(-50%);text-align:center;
-  opacity:0;will-change:opacity,transform;white-space:nowrap}
-.hud-ban .t{font-size:30px;font-weight:600;letter-spacing:.42em;text-indent:.42em}
-.hud-ban .r{height:1px;background:currentColor;opacity:.75;margin:13px auto 11px;width:280px;
-  transform:scaleX(0);will-change:transform}
-.hud-ban .s{font-size:11px;letter-spacing:.32em;text-indent:.32em;opacity:.72}
+/* Banner sits high, clear of the aim point, on a soft scrim rather than a hard
+   offset shadow. Its rule is broken in the middle so nothing crosses the
+   vertical axis the player is aiming along. */
+.hud-ban{position:absolute;left:50%;top:11.5%;transform:translateX(-50%);text-align:center;
+  opacity:0;will-change:opacity,transform;white-space:nowrap;z-index:0;
+  text-shadow:0 0 16px rgba(0,0,0,.85),0 0 5px rgba(0,0,0,.7)}
+/* Long, low, many-stop falloff. A two-stop ellipse reads as a grey blob on a
+   bright wall; this one has no visible edge anywhere. */
+.hud-ban::before{content:"";position:absolute;left:50%;top:50%;width:1240px;height:300px;
+  margin:-150px 0 0 -620px;z-index:-1;pointer-events:none;
+  background:radial-gradient(ellipse 50% 50% at 50% 50%,rgba(3,5,8,.56) 0,rgba(3,5,8,.44) 22%,
+    rgba(3,5,8,.28) 42%,rgba(3,5,8,.14) 60%,rgba(3,5,8,.05) 78%,rgba(3,5,8,0) 92%)}
+.hud-ban .t{font-size:31px;font-weight:700;letter-spacing:.40em;text-indent:.40em}
+.hud-ban .r{height:1px;margin:14px auto 12px;width:300px;transform:scaleX(0);will-change:transform;
+  background:linear-gradient(90deg,rgba(234,241,249,0) 0,rgba(234,241,249,.8) 16%,
+    rgba(234,241,249,.8) 41%,rgba(234,241,249,0) 45%,rgba(234,241,249,0) 55%,
+    rgba(234,241,249,.8) 59%,rgba(234,241,249,.8) 84%,rgba(234,241,249,0) 100%)}
+.hud-ban .s{font-size:11.5px;letter-spacing:.30em;text-indent:.30em;opacity:.78;
+  font-variant-numeric:tabular-nums}
 
 .hud-feed{position:absolute;right:30px;top:22px;text-align:right;width:420px}
 .hud-row{display:flex;align-items:center;justify-content:flex-end;gap:9px;height:19px;
@@ -128,10 +177,11 @@ const CSS = `
 
 .hud-ammo{position:absolute;right:34px;bottom:30px;text-align:right}
 .hud-ammo .nm{font-size:10.5px;letter-spacing:.30em;opacity:.55;margin-bottom:7px}
-.hud-ammo .rw{display:flex;align-items:baseline;justify-content:flex-end;gap:9px;
-  font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
-.hud-ammo .mag{font-size:42px;font-weight:600;line-height:.86;letter-spacing:.02em}
-.hud-ammo .res{font-size:16px;opacity:.42;letter-spacing:.06em}
+.hud-ammo .rw{display:flex;align-items:baseline;justify-content:flex-end;gap:9px}
+.hud-ammo .mag{font-size:46px;line-height:.84;transform:scaleX(.9);transform-origin:100% 50%}
+.hud-ammo .res{font-size:17px;opacity:.44;font-weight:400;transform:scaleX(.92);
+  transform-origin:100% 50%}
+.hud-ammo .res::before{content:"/ ";opacity:.5}
 .hud-ammo .bar{height:2px;width:120px;margin:9px 0 0 auto;background:rgba(234,241,249,.14);
   overflow:hidden;opacity:0}
 .hud-ammo .bar i{display:block;height:100%;background:${WARM};transform:scaleX(0);
@@ -139,25 +189,47 @@ const CSS = `
 .hud-ammo .md{font-size:10px;letter-spacing:.26em;opacity:.5;margin-top:8px}
 .hud-ammo.rl .mag,.hud-ammo.rl .res{color:rgba(198,206,216,.55)}
 .hud-ammo.rl .nm{opacity:.3}
-.hud-ammo.dry .mag{color:${BAD}}
+.hud-ammo.dry .mag,.hud-ammo.dry .res{color:${BAD}}
+.hud-ammo.dry .mag{text-shadow:0 0 14px rgba(255,74,53,.55)}
+
+/* Empty-magazine prompt. Below the aim point, on its own scrim, pulsing on the
+   HUD's dt clock so a capture is reproducible. */
+.hud-rl{position:absolute;left:50%;top:56.5%;transform:translateX(-50%);opacity:0;
+  white-space:nowrap;font-size:14px;font-weight:700;letter-spacing:.38em;text-indent:.38em;
+  color:${BAD};padding:14px 40px;will-change:opacity;
+  text-shadow:0 0 14px rgba(0,0,0,.95),0 1px 2px rgba(0,0,0,.95);
+  background:radial-gradient(ellipse 50% 50% at 50% 50%,rgba(7,3,3,.60) 0,rgba(7,3,3,.34) 40%,
+    rgba(7,3,3,.12) 66%,rgba(7,3,3,0) 88%)}
 
 .hud-left{position:absolute;left:34px;bottom:30px}
-.hud-left .sc{font-size:11px;letter-spacing:.22em;opacity:.55;font-variant-numeric:tabular-nums}
-.hud-left .sc b{font-weight:600;opacity:.95;margin-left:9px}
+.hud-left .sc{font-size:11px;letter-spacing:.22em;opacity:.6}
+.hud-left .sc b{font-size:15px;opacity:.95;margin-left:10px;transform:scaleX(.92);
+  transform-origin:0 50%;vertical-align:-1px}
 .hud-left .st{font-size:11px;letter-spacing:.22em;color:${WARM};margin-top:6px;height:11px;opacity:0}
-.hud-left .hp{display:flex;align-items:center;gap:11px;margin-top:13px}
-.hud-left .hpb{width:172px;height:3px;background:rgba(234,241,249,.13);overflow:hidden}
-.hud-left .hpb i{display:block;height:100%;background:${INK};transform-origin:0 50%;
-  will-change:transform}
-.hud-left .hpv{font-size:12px;opacity:.6;font-variant-numeric:tabular-nums;letter-spacing:.08em}
-.hud-left.w .hpb i{background:${WARM}}
-.hud-left.c .hpb i{background:${BAD}}
-.hud-left.c .hpv{color:${BAD};opacity:.9}
+.hud-left .hpl{font-size:9.5px;letter-spacing:.30em;opacity:.55;margin-top:15px}
+.hud-left .hp{display:flex;align-items:center;gap:12px;margin-top:7px}
+/* Recessed track: 25% dark well, hairline frame, two segment marks. At full
+   health the empty length still reads, so the bar has a reference. */
+.hud-left .hpb{position:relative;width:178px;height:9px;overflow:hidden;
+  background:rgba(3,6,10,.25);
+  box-shadow:inset 0 0 0 1px rgba(234,241,249,.22),inset 0 1px 2px rgba(0,0,0,.55)}
+.hud-left .hpb i{position:absolute;left:1px;top:1px;right:1px;bottom:1px;
+  transform-origin:0 50%;will-change:transform;
+  background:linear-gradient(180deg,rgba(255,255,255,.96) 0,rgba(206,222,238,.80) 100%)}
+.hud-left .hpb u{position:absolute;top:0;bottom:0;width:1px;display:block;
+  background:rgba(3,6,10,.62)}
+.hud-left .hpv{font-size:19px;opacity:.72;transform:scaleX(.9);transform-origin:0 50%}
+.hud-left.w .hpb i{background:linear-gradient(180deg,${WARM} 0,rgba(214,138,44,.86) 100%)}
+.hud-left.c .hpb i{background:linear-gradient(180deg,${BAD} 0,rgba(190,44,30,.9) 100%)}
+.hud-left.c .hpv{color:${BAD};opacity:.95}
+.hud-left.c .hpl{color:${BAD};opacity:.7}
 
-.hud-perf{position:absolute;left:34px;top:22px;font-size:10.5px;line-height:1.55;
-  letter-spacing:.08em;white-space:pre;opacity:.72;font-variant-numeric:tabular-nums}
-.hud-bench{position:absolute;left:34px;top:118px;font-size:10.5px;line-height:1.6;
-  letter-spacing:.08em;white-space:pre;opacity:0;color:${WARM}}
+/* Debug voice — monospace, scrimmed, and off by default. SHIFT+F reveals it. */
+.hud-perf,.hud-bench{position:absolute;left:26px;font:10.5px/1.55 ${MONO};letter-spacing:.06em;
+  white-space:pre;padding:8px 12px;background:rgba(4,7,11,.62);
+  border-left:2px solid rgba(255,177,74,.5)}
+.hud-perf{top:20px;display:none;opacity:.9}
+.hud-bench{top:150px;opacity:0;color:${WARM}}
 `;
 
 // Abstract weapon glyph for the killfeed — a fictional silhouette, not a
@@ -183,52 +255,68 @@ export class HUD {
     this.$grade = mkEl('div', 'hud-grade', this.el);
 
     // ---------------------------------------------------------- reticle
-    this.retCss = 200;
+    this.retCss = 220;
     this.$ret = mkEl('canvas', 'hud-ret', this.el);
     this.$ret.width = this.retW = Math.round(this.retCss * this.dpr);
     this.$ret.height = this.retH = this.retW;
     this.$ret.style.width = this.retCss + 'px';
     this.$ret.style.height = this.retCss + 'px';
+    // Integer margin, not translate(-50%) — see CRISPNESS above.
+    this.$ret.style.margin = (-this.retCss / 2) + 'px 0 0 ' + (-this.retCss / 2) + 'px';
     this.retCtx = this.$ret.getContext('2d');
-    this._retSig = new Int32Array(8);
+    this._retSig = new Int32Array(10);
     this._retSig[0] = -1;
 
     // ---------------------------------------------------------- damage arcs
+    // Four concentric arcs of decreasing span and increasing alpha. Stacking them
+    // fakes a tapered stroke — bright and thin at the bearing, bleeding out to
+    // nothing at the ends — which a single round-capped stroke cannot do, and it
+    // costs no filter pass.
+    const ARC_L = 'M-13.07 -42.74 A44.7 44.7 0 0 1 13.07 -42.74';
+    const ARC_M = 'M-10.05 -43.55 A44.7 44.7 0 0 1 10.05 -43.55';
+    const ARC_S = 'M-6.22 -44.26 A44.7 44.7 0 0 1 6.22 -44.26';
     this.$arcs = mkEl('div', 'hud-arcs', this.el);
     this.arcs = [];
     for (let i = 0; i < 4; i++) {
       const d = mkEl('div', 'hud-arc', this.$arcs);
       d.innerHTML = '<svg viewBox="-50 -50 100 100">' +
-        '<path d="M-17.9 -40.2 A44 44 0 0 1 17.9 -40.2" fill="none" stroke="rgba(0,0,0,.5)" stroke-width="3.2"/>' +
-        '<path d="M0 -38.6 v-3.4" stroke="rgba(0,0,0,.5)" stroke-width="2.6"/>' +
-        '<path d="M-17.9 -40.2 A44 44 0 0 1 17.9 -40.2" fill="none" stroke="currentColor" stroke-width="1.5"/>' +
-        '<path d="M0 -38.6 v-3.4" stroke="currentColor" stroke-width="1.2"/></svg>';
+        '<path d="' + ARC_L + '" fill="none" stroke="rgba(0,0,0,.42)" stroke-width="3" stroke-linecap="round"/>' +
+        '<path d="M0 -40 v-4" stroke="rgba(0,0,0,.42)" stroke-width="2.6" stroke-linecap="round"/>' +
+        '<path d="' + ARC_L + '" fill="none" stroke="currentColor" stroke-opacity=".18" stroke-width="4.6" stroke-linecap="round"/>' +
+        '<path d="' + ARC_L + '" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5" stroke-linecap="round"/>' +
+        '<path d="' + ARC_M + '" fill="none" stroke="currentColor" stroke-opacity=".72" stroke-width="1.7" stroke-linecap="round"/>' +
+        '<path d="' + ARC_S + '" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>' +
+        '<path d="M0 -40 v-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
       this.arcs.push({ el: d, t: 0, life: 0, bearing: 0, wroteRot: 1e9, wroteA: -1 });
     }
 
     // ---------------------------------------------------------- compass
-    this.compH = 34;
-    this.ppd = 3.2;                       // CSS px per degree of yaw
+    this.compH = 36;
+    this.ppd = 3.2;                       // CSS px per degree of yaw — 5° = 16px exactly
     this.$comp = mkEl('canvas', 'hud-comp', this.el);
     this.compCtx = this.$comp.getContext('2d');
     this.tape = document.createElement('canvas');
+    this.compCss = 0;
+    this._scrim = null;
     this._sizeCompass();
     this._buildTape();
     this._compSig = -1e9;
     this._markT = 0;
 
-    this.$obj = mkEl('div', 'hud-obj sh', this.el);
+    this.$obj = mkEl('div', 'hud-obj', this.el);
     this.$obj.innerHTML = '<b></b><i></i><span></span>';
     this.$objW = this.$obj.querySelector('b');
     this.$objR = this.$obj.querySelector('span');
 
     // ---------------------------------------------------------- banner
-    this.$ban = mkEl('div', 'hud-ban sh', this.el);
+    this.$ban = mkEl('div', 'hud-ban', this.el);
     this.$ban.innerHTML = '<div class="t"></div><div class="r"></div><div class="s"></div>';
     this.$banT = this.$ban.querySelector('.t');
     this.$banR = this.$ban.querySelector('.r');
     this.$banS = this.$ban.querySelector('.s');
-    this.ban = { t: 0, life: 0, wroteA: -1, wroteR: -1 };
+    // live=1 means the subtitle tracks the director's hostile count instead of
+    // holding the number the banner was raised with.
+    this.ban = { t: 0, life: 0, wroteA: -1, wroteR: -1, live: 0, tail: '' };
 
     // ---------------------------------------------------------- killfeed
     this.$feed = mkEl('div', 'hud-feed sh', this.el);
@@ -245,28 +333,36 @@ export class HUD {
 
     // ---------------------------------------------------------- ammo
     this.$ammo = mkEl('div', 'hud-ammo sh', this.el);
-    this.$ammo.innerHTML = '<div class="nm"></div><div class="rw"><span class="mag">0</span>' +
-      '<span class="res">0</span></div><div class="bar"><i></i></div><div class="md"></div>';
+    this.$ammo.innerHTML = '<div class="nm"></div><div class="rw"><span class="mag num">0</span>' +
+      '<span class="res num">0</span></div><div class="bar"><i></i></div><div class="md"></div>';
     this.$nm = this.$ammo.querySelector('.nm');
     this.$mag = this.$ammo.querySelector('.mag');
     this.$res = this.$ammo.querySelector('.res');
     this.$bar = this.$ammo.querySelector('.bar');
     this.$barI = this.$ammo.querySelector('.bar i');
     this.$md = this.$ammo.querySelector('.md');
+    this.$rl = mkEl('div', 'hud-rl', this.el);
+    this.$rl.textContent = 'RELOAD';
 
     // ---------------------------------------------------------- score / health
     this.$left = mkEl('div', 'hud-left sh', this.el);
-    this.$left.innerHTML = '<div class="sc">SCORE<b>0</b></div><div class="st"></div>' +
-      '<div class="hp"><div class="hpb"><i></i></div><span class="hpv">100</span></div>';
+    this.$left.innerHTML =
+      '<div class="sc">SCORE<b class="num">0</b></div><div class="st"></div>' +
+      '<div class="hpl">VITALS</div>' +
+      '<div class="hp"><div class="hpb"><i></i><u style="left:33.33%"></u><u style="left:66.66%"></u></div>' +
+      '<span class="hpv num">100</span></div>';
     this.$score = this.$left.querySelector('.sc b');
     this.$streak = this.$left.querySelector('.st');
     this.$hpI = this.$left.querySelector('.hpb i');
     this.$hpV = this.$left.querySelector('.hpv');
 
     // ---------------------------------------------------------- perf readout
-    this.$perf = mkEl('div', 'hud-perf sh', this.el);
-    this.$bench = mkEl('div', 'hud-bench sh', this.el);
-    this.perfOn = true;
+    // Engine telemetry is off by default: it is debug output, and it was ending up
+    // in every judged frame. SHIFT+F (main.js) toggles it. The benchmark panel is
+    // independent of the toggle — it is opacity 0 until a run actually reports.
+    this.$perf = mkEl('div', 'hud-perf', this.el);
+    this.$bench = mkEl('div', 'hud-bench', this.el);
+    this.perfOn = false;
     this._perfT = 0;
     this._perfTxt = '';
     this._benchTxt = '';
@@ -275,7 +371,8 @@ export class HUD {
     this.bloom = 0;          // mirrors weaponfx's hipfire bloom, fed by EV.SHOT
     this.sinceShot = 9;
     this.flick = 0;          // reticle rotation impulse on a confirmed hit
-    this.hmT = 9; this.hmDur = 0.13; this.hmKind = 0;
+    this.hmT = 9; this.hmDur = 0.12; this.hmKind = 0;
+    this.killT = 9;          // kill flourish ring, separate life from the marker
     this.hurt = 0;           // damage flash, 0..1
     this.beat = 0;           // heartbeat phase at low health
     this.reloadT = -1; this.reloadDur = 1;
@@ -286,9 +383,8 @@ export class HUD {
     this.c = {
       mag: -1, res: -1, name: '', mode: '', dry: -1, rl: -1, bar: -1,
       score: -1, streak: -1, hp: -1, hpc: '', wave: '', rem: '',
-      vig: -1, grade: -1, edge: -1, sec: -1, barA: -1,
+      vig: -1, grade: -1, edge: -1, sec: -1, barA: -1, pulse: -2, rlTxt: 'RELOAD',
     };
-    this._secA = 1;
 
     this._onResize = () => { this._sizeCompass(); this._compSig = -1e9; this._retSig[0] = -1; };
     addEventListener('resize', this._onResize);
@@ -318,12 +414,14 @@ export class HUD {
   _onHit(e) {
     if (!e || !e.victim) return;          // world impacts do not mark
     this._mark(e.headshot ? 1 : 0);
-    this.flick = e.headshot ? 0.30 : 0.20;
+    // A nudge, not a spin: past ~7° the four ticks stop reading as a reticle.
+    this.flick = e.headshot ? 0.14 : 0.10;
   }
 
   _onKill(e) {
     this._mark(e && e.headshot ? 3 : 2);
-    this.flick = 0.34;
+    this.flick = 0.17;
+    this.killT = 0;                      // flourish ring, outlives the marker
     const victim = (e && e.victim && this.names.get(e.victim)) || 'HOSTILE';
     this._pushFeed(PLAYER_CALLSIGN, victim, !!(e && e.headshot));
   }
@@ -332,7 +430,7 @@ export class HUD {
     // A kill marker always wins over a body marker that is already playing.
     if (this.hmT < this.hmDur && kind < this.hmKind) return;
     this.hmKind = kind;
-    this.hmDur = kind >= 2 ? 0.19 : 0.13;
+    this.hmDur = kind >= 2 ? 0.18 : 0.12;
     this.hmT = 0;
   }
 
@@ -355,7 +453,7 @@ export class HUD {
       slot = this.arcs[0];
       for (const a of this.arcs) if (a.life - a.t < slot.life - slot.t) slot = a;
     }
-    slot.bearing = bearing; slot.t = 0; slot.life = 1.5;
+    slot.bearing = bearing; slot.t = 0; slot.life = 1.6;
   }
 
   _onReload(e) {
@@ -369,8 +467,9 @@ export class HUD {
 
   _onWave(e) {
     if (!e) return;
-    if (e.phase === 'start') this._banner('WAVE ' + e.index, (e.remaining || 0) + ' HOSTILES INBOUND');
-    else if (e.phase === 'clear') this._banner('SECTOR CLEAR', 'WAVE ' + e.index + ' COMPLETE  ·  REGROUP');
+    // The count is deliberately NOT read from the event. _readouts owns it.
+    if (e.phase === 'start') this._banner('WAVE ' + e.index, '', 1, ' INBOUND');
+    else if (e.phase === 'clear') this._banner('SECTOR CLEAR', 'WAVE ' + e.index + '  ·  REGROUP');
   }
 
   _onDeath(e) {
@@ -381,8 +480,8 @@ export class HUD {
     if (!e) return;
     if (e.kind === 'togglePerf') {
       this.perfOn = !this.perfOn;
-      this.$perf.style.display = this.perfOn ? '' : 'none';
-      this.$bench.style.display = this.perfOn ? '' : 'none';
+      this.$perf.style.display = this.perfOn ? 'block' : 'none';
+      if (this.perfOn) this._perfT = 1;    // repaint on the next update, not in 0.25s
     } else if (e.kind === 'benchStart') {
       this._benchTxt = '';
       this.$bench.textContent = 'BENCHMARK RUNNING — 20s\nHOLD STILL OR PLAY NORMALLY';
@@ -398,9 +497,17 @@ export class HUD {
     }
   }
 
-  _banner(title, sub) {
+  /**
+   * @param live 1 = subtitle is re-written from the director's live hostile count
+   *             every time that count changes, with `tail` appended.
+   */
+  _banner(title, sub, live, tail) {
     this.$banT.textContent = title;
-    this.$banS.textContent = sub;
+    this.ban.live = live || 0;
+    this.ban.tail = tail || '';
+    // A live banner takes its first subtitle from the cached count string, so it
+    // is already correct on the frame it appears.
+    this.$banS.textContent = this.ban.live ? (this.c.rem || '') + this.ban.tail : sub;
     this.ban.t = 0; this.ban.life = 3.4;
     this.ban.wroteA = -1; this.ban.wroteR = -1;
   }
@@ -431,61 +538,87 @@ export class HUD {
   _sizeCompass() {
     this._sizeView();
     const vw = (typeof innerWidth === 'number' && innerWidth) || 1920;
-    const w = Math.round(Math.max(340, Math.min(660, vw * 0.42)));
+    // Even width so the integer half-width margin centres it exactly, and a
+    // multiple of the 16px minor-tick pitch so the tape blit never lands between
+    // ticks at the mask edges.
+    let w = Math.round(Math.max(340, Math.min(672, vw * 0.42)) / 16) * 16;
     if (w === this.compCss) return;
     this.compCss = w;
     this.$comp.style.width = w + 'px';
     this.$comp.style.height = this.compH + 'px';
+    this.$comp.style.marginLeft = (-w / 2) + 'px';
     this.$comp.width = this.compW = Math.round(w * this.dpr);
     this.$comp.height = this.compHpx = Math.round(this.compH * this.dpr);
+    // Cached once — createLinearGradient must never run per frame.
+    const g = this.compCtx.createLinearGradient(0, 0, 0, this.compHpx);
+    g.addColorStop(0.00, 'rgba(3,6,10,0.30)');
+    g.addColorStop(0.12, 'rgba(3,6,10,0.62)');
+    g.addColorStop(0.78, 'rgba(3,6,10,0.54)');
+    g.addColorStop(1.00, 'rgba(3,6,10,0.00)');
+    this._scrim = g;
   }
 
-  /** Pre-render the full 360° tape once; the live pass is three blits. */
+  /**
+   * Pre-render the full 360° tape once; the live pass is three blits.
+   * Light-on-dark: the scrim under the tape carries the contrast, so ticks are
+   * drawn as clean light rects with no per-tick black skirt. Every x is an
+   * integer device pixel and the pitch (5° = 16 CSS px) is integral too, so
+   * neighbouring ticks are rasterised identically instead of one landing on a
+   * pixel boundary and the next straddling two.
+   */
   _buildTape() {
     const d = this.dpr, ppd = this.ppd;
     const W = this.tapeW = Math.round(360 * ppd * d);
     const H = Math.round(this.compH * d);
     this.tape.width = W; this.tape.height = H;
     const c = this.tape.getContext('2d');
-    const base = Math.round(H * 0.80);
     const tw = Math.max(1, Math.round(d));
-    const wrap = (x, fn) => { fn(x); if (x < 30 * d) fn(x + W); else if (x > W - 30 * d) fn(x - W); };
+    const wrap = (x, fn) => { fn(x); if (x < 40 * d) fn(x + W); else if (x > W - 40 * d) fn(x - W); };
 
+    // Ticks hang from the top edge; the label row sits under them. One direction,
+    // one rhythm — the centre index reads against it immediately.
     for (let deg = 0; deg < 360; deg += 5) {
-      const card = deg % 45 === 0;
-      if (card) continue;
+      if (deg % 45 === 0) continue;               // cardinal slots carry a glyph
       const major = deg % 15 === 0;
-      const h = Math.round((major ? 9 : 5) * d);
+      const h = Math.round((major ? 10 : 6) * d);
       const x = Math.round(deg * ppd * d);
       wrap(x, (xx) => {
-        c.fillStyle = SHADOW;
-        c.fillRect(xx - (tw >> 1) - 1, base - h - 1, tw + 2, h + 2);
-        c.fillStyle = major ? 'rgba(234,241,249,.62)' : 'rgba(234,241,249,.26)';
-        c.fillRect(xx - (tw >> 1), base - h, tw, h);
+        c.fillStyle = major ? 'rgba(240,247,253,.92)' : 'rgba(228,238,248,.58)';
+        c.fillRect(xx - (tw >> 1), 0, tw, h);
       });
     }
 
     c.textAlign = 'center';
     c.textBaseline = 'alphabetic';
-    c.shadowColor = 'rgba(0,0,0,.9)';
-    c.shadowBlur = 4 * d;
-    c.shadowOffsetY = d;
+    c.shadowColor = 'rgba(0,0,0,.85)';
+    c.shadowBlur = 3 * d;
+    const labelY = Math.round(26 * d);
     for (let i = 0; i < 8; i++) {
       const deg = i * 45;
       const x = Math.round(deg * ppd * d);
       const primary = deg % 90 === 0;
-      c.font = (primary ? 600 : 400) + ' ' + Math.round((primary ? 14 : 11) * d) + 'px ' + MONO;
-      c.fillStyle = primary ? 'rgba(240,246,252,.96)' : 'rgba(234,241,249,.62)';
-      wrap(x, (xx) => c.fillText(CARD[i], xx, base - Math.round(3 * d)));
+      c.font = (primary ? 700 : 600) + ' ' + Math.round((primary ? 14.5 : 11) * d) + 'px ' + TECH;
+      c.fillStyle = primary ? 'rgba(244,249,254,.98)' : 'rgba(232,240,249,.70)';
+      // The cardinal's own tick, short and bright, above its glyph.
+      wrap(x, (xx) => {
+        c.save(); c.shadowBlur = 0;
+        c.fillStyle = primary ? 'rgba(244,249,254,.92)' : 'rgba(232,240,249,.62)';
+        c.fillRect(xx - (tw >> 1), 0, tw, Math.round(13 * d));
+        c.restore();
+        c.fillStyle = primary ? 'rgba(244,249,254,.98)' : 'rgba(232,240,249,.70)';
+        c.fillText(CARD[i], xx, labelY);
+      });
     }
-    c.font = 400 + ' ' + Math.round(8.5 * d) + 'px ' + MONO;
-    c.fillStyle = 'rgba(234,241,249,.34)';
+    // Bearings only every 30°. Every 15° turned the label row into a ladder and
+    // fought the cardinals for attention.
+    c.font = '400 ' + Math.round(9 * d) + 'px ' + TECH;
+    c.fillStyle = 'rgba(228,238,248,.50)';
     for (let deg = 30; deg < 360; deg += 30) {
       if (deg % 45 === 0) continue;
       const x = Math.round(deg * ppd * d);
-      wrap(x, (xx) => c.fillText(String(deg), xx, base - Math.round(12 * d)));
+      wrap(x, (xx) => c.fillText(String(deg), xx, labelY - Math.round(1.5 * d)));
     }
-    c.shadowBlur = 0; c.shadowOffsetY = 0;
+    c.shadowBlur = 0;
   }
 
   // ================================================================= update
@@ -502,6 +635,7 @@ export class HUD {
     if (this.sinceShot > 0.12) this.bloom = Math.max(0, this.bloom - dt * 2.4);
     this.flick *= Math.exp(-dt * 13);
     if (this.hmT < this.hmDur) this.hmT += dt;
+    if (this.killT < KILL_LIFE) this.killT += dt;
     this.hurt = Math.max(0, this.hurt - dt * 1.8);
     if (this.reloadT >= 0) this.reloadT += dt;
 
@@ -535,15 +669,20 @@ export class HUD {
 
     const d = this.dpr;
     // Hip: four long ticks at the true cone edge plus a centre dot. ADS: the
-    // ticks collapse to a tight optic frame and the dot yields to the real one
+    // ticks pinch to a tight optic frame and the dot yields to the real one
     // rendered on the sight, so the screen centre stays clear of the target.
-    const lenPx = 11 - adsE * 6.5;
+    const lenPx = 12 - adsE * 7.5;
     // Capped so a full-bloom airborne spray still draws inside the canvas — and
     // because a reticle wider than the shoulder-width of a target is useless.
-    const gapCap = this.retCss * 0.5 - lenPx - 6;
-    const gapPx = Math.min(gapCap, (2.5 + spread * this._px) * (1 - adsE * 0.12));
-    const thPx = 2 - adsE * 0.5;
-    const tickA = (0.88 - adsE * 0.62) * (1 - clamp01(w.sprint || 0) * 0.5);
+    const gapCap = this.retCss * 0.5 - lenPx - 8;
+    const gapPx = Math.min(gapCap, (2.5 + spread * this._px) * (1 - adsE * 0.34));
+    // 3px of core at hip: with a 1px dark outline on each side, a 2px tick reads
+    // as a grey pill rather than a white one against a bright wall.
+    const thPx = 3 - adsE * 1;
+    // Pinches shut before the sight picture is fully up: at full ADS the optic's
+    // own reticle is the aiming reference and a HUD cross over it reads as dirt
+    // on the lens.
+    const tickA = Math.max(0, 0.92 - adsE * 1.05) * (1 - clamp01(w.sprint || 0) * 0.5);
     const dotA = 0.95 * (1 - adsE);
 
     const s = this._retSig;
@@ -554,10 +693,11 @@ export class HUD {
     const da = (dotA * 100) | 0;
     const fl = (this.flick * 300) | 0;
     const hm = this.hmT < this.hmDur ? (((this.hmT / this.hmDur) * 40) | 0) + 1 + this.hmKind * 64 : 0;
+    const kr = this.killT < KILL_LIFE ? (((this.killT / KILL_LIFE) * 40) | 0) + 1 : 0;
     const ae = (adsE * 60) | 0;
     if (s[0] === g && s[1] === L && s[2] === th && s[3] === ta && s[4] === da &&
-        s[5] === fl && s[6] === hm && s[7] === ae) return;
-    s[0] = g; s[1] = L; s[2] = th; s[3] = ta; s[4] = da; s[5] = fl; s[6] = hm; s[7] = ae;
+        s[5] === fl && s[6] === hm && s[7] === ae && s[8] === kr) return;
+    s[0] = g; s[1] = L; s[2] = th; s[3] = ta; s[4] = da; s[5] = fl; s[6] = hm; s[7] = ae; s[8] = kr;
 
     const c = this.retCtx, W = this.retW, H = this.retH;
     c.clearRect(0, 0, W, H);
@@ -572,6 +712,8 @@ export class HUD {
       c.arc(cx, cy, Math.round(30 * d), 0, Math.PI * 2);
       c.stroke();
     }
+
+    if (kr) this._killRing(c, cx, cy);
 
     c.globalAlpha = tickA;
     const rot = this.flick;
@@ -604,53 +746,115 @@ export class HUD {
     this._rect(c, cx + g, cy - h, L, th, col);
   }
 
-  /** Rect with a one-pixel dark skirt — reads over bright sky and dark interior. */
+  /**
+   * Rect with a near-black one-device-pixel outline. The outline is what makes
+   * the reticle survive blown-out stucco; it is drawn at 0.9 of the element's own
+   * alpha so a fading marker takes its outline with it.
+   */
   _rect(c, x, y, w, h, col) {
     const a = c.globalAlpha;
-    c.globalAlpha = a * 0.75;
-    c.fillStyle = SHADOW;
-    c.fillRect(x - 1, y - 1, w + 2, h + 2);
+    const o = Math.max(1, Math.round(this.dpr));
+    c.globalAlpha = a * 0.9;
+    c.fillStyle = OUTLINE;
+    c.fillRect(x - o, y - o, w + o * 2, h + o * 2);
     c.globalAlpha = a;
     c.fillStyle = col;
     c.fillRect(x, y, w, h);
   }
 
+  /**
+   * Hit confirmation. Snaps to full in ~18ms, holds, and is gone by 120ms —
+   * short enough to read as an impact rather than a widget. Kind 2/3 (kill) is
+   * warm, thicker and longer-lived, and pairs with the expanding ring below so a
+   * kill never looks like a body shot.
+   */
   _hitmarker(c, cx, cy) {
     const d = this.dpr;
     const u = clamp01(this.hmT / this.hmDur);
     const kill = this.hmKind >= 2;
     const head = this.hmKind === 1 || this.hmKind === 3;
-    // Fast attack, short hold, fast decay — the whole thing lives ~130ms.
     const k = u < 0.14 ? u / 0.14 : 1;
     const a = u < 0.5 ? 1 : 1 - (u - 0.5) / 0.5;
-    const grow = 0.74 + 0.26 * k + (1 - a) * 0.22;
+    const grow = 0.74 + 0.26 * k + (1 - a) * 0.26;
 
-    const th = Math.max(2, Math.round((kill ? 3.1 : 2) * d / 2) * 2);
-    const len = Math.round((kill ? 12 : 9) * d * grow);
-    const inner = Math.round((kill ? 8 : 6.5) * d * grow);
-    const col = kill ? WARM : head ? '#ffe2a8' : INK;
+    const th = Math.max(2, Math.round((kill ? 3.4 : 2.4) * d / 2) * 2);
+    const len = Math.round((kill ? 14 : 10.5) * d * grow);
+    const inner = Math.round((kill ? 8.5 : 7) * d * grow);
+    const col = kill ? WARM : head ? '#ffe2a8' : '#ffffff';
 
-    c.globalAlpha = a * (kill ? 1 : 0.94);
+    c.globalAlpha = a;
     c.save();
     c.translate(cx, cy);
     for (let i = 0; i < 4; i++) {
       c.save();
       c.rotate(Math.PI * 0.25 + i * Math.PI * 0.5);
       this._rect(c, inner, -(th >> 1), len, th, col);
+      if (kill) {
+        // Hot core inside the warm arm. Warm-on-warm is exactly the case the
+        // frame is full of (sunlit stucco), so the kill marker cannot rely on
+        // hue alone — it needs a value spike too.
+        const ith = Math.max(1, th - 2);
+        c.fillStyle = '#fff4de';
+        c.fillRect(inner + 1, -(ith >> 1), len - 2, ith);
+      }
       c.restore();
     }
-    if (head) {
-      // Headshot adds four axis ticks further out — a distinct starburst, still
-      // readable at a glance and never covering the target.
+    // Headshot adds four short axis ticks — a starburst rather than an X. On a
+    // headshot KILL they are left off: the ring is already saying "down", and
+    // stacking both put warm ticks straight on top of the white reticle ticks.
+    if (head && !kill) {
       const ht = Math.max(2, th - 1);
-      const hl = Math.round(len * 0.52);
-      const hi = Math.round(inner * 1.85);
+      const hl = Math.round(len * 0.5);
+      const hi = Math.round(inner * 1.55);
       for (let i = 0; i < 4; i++) {
         c.save();
         c.rotate(i * Math.PI * 0.5);
-        this._rect(c, hi, -(ht >> 1), hl, ht, kill ? WARM : '#ffe2a8');
+        this._rect(c, hi, -(ht >> 1), hl, ht, '#ffe2a8');
         c.restore();
       }
+    }
+    c.restore();
+    c.globalAlpha = 1;
+  }
+
+  /**
+   * Kill flourish: a ring that punches outward and thins as it goes, with a
+   * white leading edge and a fainter trailing ring behind it. It outlives the
+   * marker by ~200ms, which is what separates "hit" from "killed" at a glance
+   * without adding a second HUD element.
+   */
+  _killRing(c, cx, cy) {
+    const d = this.dpr;
+    const u = clamp01(this.killT / KILL_LIFE);
+    const e = 1 - Math.pow(1 - u, 2.6);          // fast out, long settle
+    const a = Math.pow(1 - u, 1.7);
+    const r = (10 + 26 * e) * d;
+    const lw = Math.max(1, Math.round((3.0 - 2.1 * e) * d));
+
+    c.save();
+    c.globalAlpha = a * 0.38;
+    c.strokeStyle = OUTLINE;
+    c.lineWidth = lw + Math.max(2, Math.round(1.5 * d));
+    c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.stroke();
+    c.globalAlpha = a * 0.95;
+    c.strokeStyle = '#ffc86e';
+    c.lineWidth = lw;
+    c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.stroke();
+    if (u < 0.4) {
+      // Value spike on the leading edge of the punch, for the same reason the
+      // arms have a hot core.
+      c.globalAlpha = a * 0.85 * (1 - u / 0.4);
+      c.strokeStyle = '#fff6e8';
+      c.lineWidth = Math.max(1, Math.round(d));
+      c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.stroke();
+    }
+    // A second ring just behind the first, wider and fainter, so the punch has
+    // some depth to it instead of reading as one flat hoop.
+    if (u < 0.55) {
+      c.globalAlpha = a * 0.30;
+      c.strokeStyle = WARM;
+      c.lineWidth = Math.max(1, Math.round(d));
+      c.beginPath(); c.arc(cx, cy, r * 0.72, 0, Math.PI * 2); c.stroke();
     }
     c.restore();
     c.globalAlpha = 1;
@@ -669,24 +873,43 @@ export class HUD {
     const c = this.compCtx, d = this.dpr, W = this.compW, H = this.compHpx;
     c.clearRect(0, 0, W, H);
 
+    // The HUD's own dark ground. Everything above it is light — the widget reads
+    // the same way over bright sky and over a black interior.
+    c.fillStyle = this._scrim;
+    c.fillRect(0, 0, W, H);
+
     const centre = this.heading * this.ppd * d;
     let x0 = Math.round(W * 0.5 - centre);
     const tw = this.tapeW;
     x0 = ((x0 % tw) + tw) % tw - tw;
     for (let x = x0; x < W; x += tw) c.drawImage(this.tape, x, 0);
 
-    // Centre index — the only warm element up here.
-    const mx = W >> 1, mw = Math.max(2, Math.round(2 * d));
-    c.globalAlpha = 0.55;
-    c.fillStyle = SHADOW;
-    c.fillRect(mx - (mw >> 1) - 1, -1, mw + 2, Math.round(9 * d) + 2);
+    // Base rule closes the widget off and gives the ticks something to sit on.
+    c.fillStyle = 'rgba(226,236,247,.20)';
+    c.fillRect(0, Math.round(31 * d), W, Math.max(1, Math.round(d)));
+
+    // Centre index — the only warm element up here. A post with a head, kept
+    // entirely inside the tick band so it can never sit on top of a cardinal
+    // glyph when the player happens to face due north.
+    const mx = W >> 1;
+    const mw = Math.max(2, Math.round(2 * d));
+    const hw = Math.max(mw + 2, Math.round(7 * d));
+    const bandH = Math.round(14 * d), headH = Math.round(3.5 * d);
+    c.globalAlpha = 0.92;
+    c.fillStyle = OUTLINE;
+    c.fillRect(mx - (hw >> 1) - 1, -1, hw + 2, headH + 2);
+    c.fillRect(mx - (mw >> 1) - 1, -1, mw + 2, bandH + 1);
     c.globalAlpha = 1;
     c.fillStyle = WARM;
-    c.fillRect(mx - (mw >> 1), 0, mw, Math.round(9 * d));
+    c.fillRect(mx - (hw >> 1), 0, hw, headH);
+    c.fillRect(mx - (mw >> 1), 0, mw, bandH);
 
     if (hasMarks) {
       const px = p.pos;
       const half = (W * 0.5) / (this.ppd * d);
+      // Threat marks own the tick band: a contact matters more than the tick it
+      // covers. They point down, into the tape, from the top edge.
+      const ty = Math.round(1 * d);
       let n = 0;
       for (let i = 0; i < list.length && n < 10; i++) {
         const e = list[i];
@@ -698,19 +921,20 @@ export class HUD {
         if (Math.abs(rel) > half) continue;
         n++;
         const ex = Math.round(mx + rel * this.ppd * d);
-        const s = Math.round(4 * d);
-        c.globalAlpha = 0.35 + 0.55 * (1 - Math.min(1, dist / 90));
-        c.fillStyle = SHADOW;
+        const s = Math.round(4.5 * d);
+        const h = Math.round(7 * d);
+        c.globalAlpha = 0.45 + 0.55 * (1 - Math.min(1, dist / 90));
+        c.fillStyle = OUTLINE;
         c.beginPath();
-        c.moveTo(ex - s - 1, Math.round(2 * d) - 1);
-        c.lineTo(ex + s + 1, Math.round(2 * d) - 1);
-        c.lineTo(ex, Math.round(2 * d) + s + 2);
+        c.moveTo(ex - s - 1, ty - 1);
+        c.lineTo(ex + s + 1, ty - 1);
+        c.lineTo(ex, ty + h + 1);
         c.fill();
         c.fillStyle = BAD;
         c.beginPath();
-        c.moveTo(ex - s, Math.round(2 * d));
-        c.lineTo(ex + s, Math.round(2 * d));
-        c.lineTo(ex, Math.round(2 * d) + s);
+        c.moveTo(ex - s, ty);
+        c.lineTo(ex + s, ty);
+        c.lineTo(ex, ty + h);
         c.fill();
       }
       c.globalAlpha = 1;
@@ -732,12 +956,34 @@ export class HUD {
       this.$md.textContent = mode ? mode + '  ·  ' + ((w.cfg && w.cfg.magSize) || '') + ' RND' : '';
     }
 
-    // Empty flashes on our own clock so a capture is reproducible.
-    const dry = mag === 0 && !w.reloading ? (((t * 3.4) | 0) & 1) : 0;
+    // Empty is the weapon's most urgent state, so it gets three signals at once:
+    // the numerals go red, they pulse, and a prompt appears under the aim point.
+    // The pulse runs on the HUD's own accumulated clock, so a capture is
+    // reproducible frame for frame.
     const rl = w.reloading ? 1 : 0;
+    const dry = mag === 0 && !rl ? 1 : 0;
     if (dry !== cc.dry || rl !== cc.rl) {
       cc.dry = dry; cc.rl = rl;
       this.$ammo.className = 'hud-ammo sh' + (rl ? ' rl' : '') + (dry ? ' dry' : '');
+      if (!dry && cc.pulse !== -2) {
+        cc.pulse = -2;
+        this.$mag.style.opacity = '';
+        this.$rl.style.opacity = '0';
+      }
+    }
+    if (dry) {
+      // Telling a player to reload with an empty belt is worse than saying
+      // nothing, so the prompt states which of the two problems they have.
+      const txt = res > 0 ? 'RELOAD' : 'NO AMMO';
+      if (txt !== cc.rlTxt) { cc.rlTxt = txt; this.$rl.textContent = txt; }
+      const s = 0.5 + 0.5 * Math.sin(t * 8.2);
+      const q = (s * 12) | 0;
+      if (q !== cc.pulse) {
+        cc.pulse = q;
+        const f = q / 12;
+        this.$mag.style.opacity = (0.52 + 0.48 * f).toFixed(2);
+        this.$rl.style.opacity = (0.45 + 0.55 * f).toFixed(2);
+      }
     }
 
     const showBar = this.reloadT >= 0 && this.reloadT <= this.reloadDur ? 1 : 0;
@@ -769,10 +1015,16 @@ export class HUD {
       ? 'NEXT WAVE ' + Math.max(0, Math.ceil(dir.timer || 0))
       : 'WAVE ' + (dir.wave | 0);
     if (wave !== cc.wave) { cc.wave = wave; this.$objW.textContent = wave; }
+    // THE hostile count. Nothing else on screen is allowed to compute one: the
+    // banner borrows this exact string, so the two can never disagree.
     const rem = dir.phase === 'intermission'
       ? 'STAND BY'
       : (dir.remaining | 0) + (dir.remaining === 1 ? ' HOSTILE' : ' HOSTILES');
-    if (rem !== cc.rem) { cc.rem = rem; this.$objR.textContent = rem; }
+    if (rem !== cc.rem) {
+      cc.rem = rem;
+      this.$objR.textContent = rem;
+      if (this.ban.live && this.ban.life > 0) this.$banS.textContent = rem + this.ban.tail;
+    }
 
     const hp = Math.max(0, Math.min(100, Math.round(p.health == null ? 100 : p.health)));
     if (hp !== cc.hp) {
@@ -803,7 +1055,7 @@ export class HUD {
     if (b.life <= 0) return;
     b.t += dt;
     if (b.t >= b.life) {
-      b.life = 0;
+      b.life = 0; b.live = 0;
       this.$ban.style.opacity = '0';
       this.$banR.style.transform = 'scaleX(0)';
       return;
@@ -835,7 +1087,7 @@ export class HUD {
       const rel = wrapDeg(a.bearing - this.heading);
       const q = Math.round(rel * 2);
       if (q !== a.wroteRot) { a.wroteRot = q; a.el.style.transform = 'rotate(' + (q / 2).toFixed(1) + 'deg)'; }
-      const f = Math.min(clamp01(a.t / 0.06), clamp01((a.life - a.t) / 0.9));
+      const f = Math.min(clamp01(a.t / 0.05), clamp01((a.life - a.t) / 0.95));
       const qa = (f * 25) | 0;
       if (qa !== a.wroteA) { a.wroteA = qa; a.el.style.opacity = (qa / 25).toFixed(2); }
     }
@@ -868,15 +1120,21 @@ export class HUD {
     }
   }
 
-  /** Secondary furniture steps back when the player aims. */
+  /**
+   * Secondary furniture steps back when the player aims, and the objective strip
+   * steps out entirely while a banner is up — the banner is already saying it,
+   * and two copies of the same count is exactly the contradiction we are fixing.
+   */
   _secondary(adsE) {
     const a = 1 - adsE * 0.62;
-    const q = (a * 25) | 0;
+    const objMul = this.ban.live && this.ban.life > 0 ? 0 : 0.74;
+    const q = ((a * 25) | 0) * 4 + (objMul > 0 ? 1 : 0);
     if (q === this.c.sec) return;
     this.c.sec = q;
-    const v = (q / 25).toFixed(2);
+    const f = ((q / 4) | 0) / 25;
+    const v = f.toFixed(2);
     this.$comp.style.opacity = v;
-    this.$obj.style.opacity = (q / 25 * 0.62).toFixed(2);
+    this.$obj.style.opacity = (f * objMul).toFixed(2);
     this.$left.style.opacity = v;
   }
 

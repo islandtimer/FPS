@@ -62,6 +62,7 @@ import { makeRng, WORLD_SEED } from '../core/rng.js';
 // (Reported to the orchestrator as a requested bus.js addition.)
 export const EV_CRACK = 'bulletCrack';   // {point, distance, speed} supersonic pass-by
 export const EV_SHELL = 'shellLand';     // {point, surface, energy}
+export const EV_ENEMY_FIRE = 'enemyFire'; // {point, dir, distance} incoming round, for audio/HUD threat cues
 
 // ---------------------------------------------------------------------------
 // tuning
@@ -72,11 +73,48 @@ const MAX_PEN = 2;              // walls a single round may pass through
 const MIN_PEN_DMG = 0.16;       // below this fraction the round is spent
 const DECAL_CAP = 288;
 const DECAL_LIFE = 26.0;
-const TRACER_CAP = 64;
+const TRACER_CAP = 96;
 const SHELL_CAP = 24;
 const ALPHA_CAP = 1024;
-const ADD_CAP = 640;
+const ADD_CAP = 768;
 const CRACK_RADIUS = 3.2;       // how close a round passes before it whips
+
+// --- FX exposure -----------------------------------------------------------
+// Particle colours are written straight into the HDR buffer with no lighting
+// pass, so a "reflectance" number like 0.66 arrives on screen four times darker
+// than the sunlit wall behind it and the puff disappears. These multipliers put
+// unlit FX back on the same scale the lit scene sits at: at the working exposure
+// a sunlit diffuse surface lands near 1.1 scene-linear, so dust at ~2.0 reads as
+// genuinely pulverised material catching the key light, and debris at ~1.4 reads
+// as a fragment of the surface it came off.
+const DUST_LIT = 3.0;
+const CHIP_LIT = 2.3;
+const GORE_LIT = 1.5;
+
+// --- muzzle flash ----------------------------------------------------------
+// FLASH_LIFE is a screenshot constraint as much as an aesthetic one: the capture
+// harness fires a round and then renders exactly two more frames, so the flash
+// has to still be at full output 33ms after ignition. It holds flat and then
+// falls off a cliff, which is also how a real flash reads on a 60Hz shutter —
+// two saturated frames and nothing on the third.
+const FLASH_LIFE = 0.048;       // particle life (shader holds full to 0.72u)
+const LIGHT_LIFE = 0.070;       // bounce light total
+const LIGHT_HOLD = 0.030;       // ...of which the tail; full above this
+const LIGHT_PEAK = 13.0;        // candela at the muzzle; ~7x sun on the handguard
+// Non-physical decay: one light is standing in for the flash AND its bounce, and
+// an inverse-square falloff that blows out the handguard leaves nothing on the
+// ground two metres away. 1.6 keeps both ends of that range on screen.
+const LIGHT_DECAY = 1.6;
+
+// --- incoming fire ---------------------------------------------------------
+// ai.js does not shoot — it closes and it dies. A firefight frame with no
+// incoming fire in it is not a firefight, so the ballistics module drives the
+// hostile side of the exchange itself: muzzle flashes at the enemy's weapon,
+// tracers threaded past the camera, and dust kicked off the cover the player is
+// standing behind. These rounds carry no damage; they are a readability system.
+const HOSTILE = Object.freeze({ damage: 24, muzzleVelocity: 730, falloff: null });
+const HOSTILE_RANGE = 46;       // single instant segment; nothing becomes a projectile
+const HOSTILE_SPEED = 730;
 
 // Surface behaviour. `soak` is damage attenuation per metre of material
 // (retain = e^-soak*thickness); `max` is the thickest slab the round will pass.
@@ -300,11 +338,17 @@ varying float vA;
 varying float vShape;
 varying float vSeed;
 
+// shape ids: 0 puff  1 spark streak  2 chip  3 flash star  4 flash cone
+//            5 hot core  6 heat haze
 void main() {
   float t = uTime - aLife.x;
   float u = t * aLife.y;
   vUv = uv; vCol = aCol; vShape = aCtl.z; vSeed = aCtl.w; vA = 0.0;
   if (u < 0.0 || u >= 1.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+
+  bool isStreak = vShape > 0.5 && vShape < 1.5;
+  bool isFlash  = vShape > 2.5 && vShape < 5.5;
+  bool isSoft   = vShape < 0.5 || vShape > 5.5;
 
   // closed-form drag + gravity: no per-frame CPU integration for any particle
   float k = max(aCtl.y, 0.02);
@@ -315,10 +359,14 @@ void main() {
   vel.y -= aCtl.x * t;
 
   vec4 mv = modelViewMatrix * vec4(p, 1.0);
-  float sz = mix(aSize.x, aSize.y, u);
+  // A dust cloud is nearly its final size within the first few frames and then
+  // stalls. Linear growth made every fresh impact a dot for a tenth of a second,
+  // which is exactly the window the screenshot lands in.
+  float su = isSoft ? pow(max(u, 1e-4), 0.42) : u;
+  float sz = mix(aSize.x, aSize.y, su);
   vec2 off = position.xy * sz;
 
-  if (vShape > 0.5 && vShape < 1.5) {
+  if (isStreak) {
     // spark streak: stretch along screen-space velocity so it reads as a trail
     vec3 vv = (modelViewMatrix * vec4(vel, 0.0)).xyz;
     vec2 d = vv.xy;
@@ -333,17 +381,47 @@ void main() {
     float a = aCtl.w * 6.2831 + t * (4.0 + aCtl.w * 22.0);
     float c = cos(a), s = sin(a);
     off = vec2(off.x * c - off.y * s, off.x * s + off.y * c);
+  } else if (vShape > 3.5 && vShape < 4.5) {
+    // flash cone: lay the quad along the bore in SCREEN space and push it
+    // forward so the wide end sits on the muzzle. aVel carries the bore.
+    vec3 vv = (modelViewMatrix * vec4(vel, 0.0)).xyz;
+    vec2 d = vv.xy;
+    float L = length(d);
+    // near-axial bore (shooting away from camera) has no screen direction to
+    // stretch along; fall back to a plain radial burst rather than a sliver.
+    if (L > 0.20 * length(vv)) {
+      d /= L;
+      float st = 1.6 + aCtl.w * 1.8;
+      off = d * ((position.x + 0.5) * sz * st) + vec2(-d.y, d.x) * (position.y * sz);
+    } else {
+      off = position.xy * sz * 1.35;
+    }
+  } else if (vShape > 5.5) {
+    // heat haze: a rising lens of warm air, wobbling as it goes
+    off.y *= 2.1;
+    off.x += sin(t * 6.3 + aCtl.w * 31.0) * sz * 0.55
+           + sin(t * 14.7 + aCtl.w * 11.0) * sz * 0.22;
+  } else if (vShape > 2.5 && vShape < 3.5) {
+    // flash star: a fixed roll per shot so consecutive rounds never repeat
+    float a = aCtl.w * 6.2831;
+    float c = cos(a), s = sin(a);
+    off = vec2(off.x * c - off.y * s, off.x * s + off.y * c);
   }
 
   mv.xy += off;
   gl_Position = projectionMatrix * mv;
 
-  // life curve: puffs bloom then dissipate, sparks decay hard
-  float fadeIn = smoothstep(0.0, 0.10, u);
-  float fadeOut = 1.0 - smoothstep(vShape > 0.5 && vShape < 1.5 ? 0.35 : 0.45, 1.0, u);
+  // Life curve. A flash holds flat and then falls off a cliff — no ramp in, no
+  // long tail — because the eye reads its peak, not its average, and because the
+  // capture harness photographs it two frames after ignition.
+  float fadeIn = isFlash ? 1.0 : smoothstep(0.0, 0.045, u);
+  float fadeOut = isFlash ? (1.0 - smoothstep(0.72, 1.0, u))
+                          : (1.0 - smoothstep(isStreak ? 0.35 : 0.45, 1.0, u));
   vA = fadeIn * fadeOut;
-  if (vShape > 0.5 && vShape < 1.5) vA *= 0.55 + 0.45 * sin(t * 96.0 + aCtl.w * 40.0);
-  // distant FX must not out-punch the aerial perspective the sky module sets up
+  if (isStreak) vA *= 0.55 + 0.45 * sin(t * 96.0 + aCtl.w * 40.0);
+  // Distance: unlit particles carry no aerial perspective, so thin them with
+  // range. Flashes are exempt — a shooter 40m away must still be locatable.
+  if (!isFlash) vA *= 1.0 - 0.38 * smoothstep(14.0, 80.0, -mv.z);
   vA *= 1.0 - smoothstep(55.0, 130.0, -mv.z);
 }
 `;
@@ -358,13 +436,19 @@ varying float vSeed;
 void main() {
   vec2 q = vUv - 0.5;
   float a;
+  // Brightness is carried in the colour, never in an alpha above 1.0: a blend
+  // factor over one is only defined on a float target and we do not own the
+  // render target's format.
+  float b = 1.0;
   if (vShape < 0.5) {
     // soft puff, slightly lumpy so it is not a gaussian blob
     float d = length(q) * 2.0;
-    float lump = 1.0 + 0.18 * sin(atan(q.y, q.x) * 3.0 + vSeed * 6.2831);
+    float ang = atan(q.y, q.x);
+    float lump = 1.0 + 0.18 * sin(ang * 3.0 + vSeed * 6.2831)
+                     + 0.11 * sin(ang * 7.0 - vSeed * 11.3);
     a = smoothstep(1.0, 0.05, d / lump);
     // dust you can see through: a fully opaque puff reads as a paper cut-out
-    a *= a * 0.62;
+    a *= a * 0.70;
   } else if (vShape < 1.5) {
     float core = smoothstep(0.5, 0.0, abs(q.y) * 2.0);
     a = core * smoothstep(0.5, 0.12, abs(q.x));
@@ -372,17 +456,43 @@ void main() {
   } else if (vShape < 2.5) {
     vec2 s = abs(q);
     a = step(s.x + s.y * 1.6, 0.42);
-  } else {
-    // muzzle flash: petal count varies per shot
+  } else if (vShape < 3.5) {
+    // Muzzle star. Two harmonics of different period and an odd petal count so
+    // no two spokes match: a symmetric star reads as a decal, not as burning gas.
     float ang = atan(q.y, q.x);
     float r = length(q);
     float petals = 3.0 + floor(vSeed * 4.0);
-    float lobe = 0.26 + 0.17 * sin(ang * petals + vSeed * 6.2831);
-    a = smoothstep(lobe, 0.0, r);
-    a = a * a + smoothstep(0.15, 0.0, r);
+    float lobe = 0.115
+      + 0.150 * abs(sin(ang * petals * 0.5 + vSeed * 6.2831))
+      + 0.055 * sin(ang * (petals + 3.0) - vSeed * 12.9)
+      + 0.030 * sin(ang * 2.0 + vSeed * 3.7);
+    float star = smoothstep(lobe, 0.0, r);
+    float core = smoothstep(0.17, 0.02, r);
+    a = clamp(star * star + core, 0.0, 1.0);
+    b = 1.0 + core * 3.2 + star * 0.6;
+  } else if (vShape < 4.5) {
+    // Flash cone: fat at the muzzle end, drawn to a point downrange, with the
+    // gas front torn rather than smooth.
+    float x = q.x + 0.5;                       // 0 at muzzle, 1 downrange
+    float tear = 1.0 + 0.22 * sin(x * 17.0 + vSeed * 20.0);
+    float halfw = (0.5 - 0.47 * x) * tear;
+    float body = smoothstep(halfw, halfw * 0.15, abs(q.y));
+    a = clamp(body * (1.0 - smoothstep(0.55, 1.0, x)), 0.0, 1.0);
+    b = 1.0 + body * (1.0 - x) * 1.1;
+  } else if (vShape < 5.5) {
+    // Hot core: the pixel that actually clips. Hard shoulder, tiny halo.
+    float r = length(q) * 2.0;
+    float core = smoothstep(0.88, 0.28, r);
+    a = clamp(core + smoothstep(1.0, 0.0, r) * 0.55, 0.0, 1.0);
+    b = 1.0 + core * 2.4;
+  } else {
+    // Heat haze off a hot barrel — low contrast, banded, never a solid shape.
+    float d = length(vec2(q.x * 1.9, q.y)) * 2.0;
+    float band = 0.55 + 0.45 * sin(q.y * 21.0 + vSeed * 18.0 + q.x * 7.0);
+    a = smoothstep(1.0, 0.10, d) * band * 0.17;
   }
   if (a <= 0.001 || vA <= 0.001) discard;
-  gl_FragColor = vec4(vCol, a * vA);
+  gl_FragColor = vec4(vCol * b, a * vA);
 }
 `;
 
@@ -610,18 +720,22 @@ attribute vec3 aStart;
 attribute vec3 aDir;
 attribute vec3 aCol;
 attribute vec4 aParam;   // length, birth, 1/life, speed
+attribute vec2 aStyle;   // width multiplier, trail length in metres
 varying vec3 vCol;
 varying float vA;
 varying float vT;
+varying float vW;
 
 void main() {
   float t = uTime - aParam.y;
   float u = t * aParam.z;
-  vCol = aCol; vA = 0.0; vT = 0.0;
+  vCol = aCol; vA = 0.0; vT = 0.0; vW = 0.0;
   if (u < 0.0 || u >= 1.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
 
+  // Real travel time: the head is where the round actually is this frame, not a
+  // line drawn instantly from muzzle to impact.
   float headD = min(aParam.x, aParam.w * t);
-  float trail = min(9.0, aParam.x * 0.65);
+  float trail = min(aStyle.y, aParam.x * 0.85);
   float tailD = max(0.0, headD - trail);
   vec4 mvH = modelViewMatrix * vec4(aStart + aDir * headD, 1.0);
   vec4 mvT = modelViewMatrix * vec4(aStart + aDir * tailD, 1.0);
@@ -633,11 +747,12 @@ void main() {
   vec3 side = cross(seg, toCam);
   float L = length(side);
   // a tracer thinner than a pixel flickers; widen it a little with distance
-  float w = 0.016 + 0.0018 * (-mv.z);
+  float w = (0.020 + 0.0026 * max(-mv.z, 0.0)) * aStyle.x;
   if (L > 1e-6) mv.xyz += side * (position.y * w * 2.0 / L);
 
   gl_Position = projectionMatrix * mv;
   vT = s;
+  vW = position.y * 2.0;
   vA = (1.0 - u) * (1.0 - u);
 }
 `;
@@ -646,11 +761,18 @@ const TRACER_FRAG = /* glsl */`
 varying vec3 vCol;
 varying float vA;
 varying float vT;
+varying float vW;
 void main() {
-  float taper = smoothstep(0.0, 0.45, vT);
+  float taper = smoothstep(0.0, 0.40, vT);
   float a = vA * taper;
   if (a <= 0.002) discard;
-  gl_FragColor = vec4(vCol * (0.55 + 0.45 * vT), a);
+  // A tracer is a hot filament inside a soft glow, brightest at the head. The
+  // filament is what clips; the glow is what makes it findable at 40m.
+  float d = abs(vW);
+  float glow = smoothstep(1.0, 0.05, d);
+  float hot = smoothstep(0.55, 0.0, d);
+  vec3 c = vCol * (0.30 + 0.70 * vT) * (glow * glow * 0.55 + hot * hot * 2.3);
+  gl_FragColor = vec4(c, a);
 }
 `;
 
@@ -669,7 +791,8 @@ class TracerField {
     this.aDir = mk('aDir', 3);
     this.aCol = mk('aCol', 3);
     this.aParam = mk('aParam', 4);
-    this.attrs = [this.aStart, this.aDir, this.aCol, this.aParam];
+    this.aStyle = mk('aStyle', 2);
+    this.attrs = [this.aStart, this.aDir, this.aCol, this.aParam, this.aStyle];
     for (let i = 0; i < cap; i++) this.aParam.array[i * 4 + 1] = -1e9;
 
     this.geometry = g;
@@ -689,7 +812,7 @@ class TracerField {
     this.mesh.castShadow = this.mesh.receiveShadow = false;
   }
 
-  fire(x, y, z, dx, dy, dz, len, speed, r, g, b, life, now) {
+  fire(x, y, z, dx, dy, dz, len, speed, r, g, b, life, now, wid, trail) {
     const i = this.i;
     this.i = (i + 1) % this.cap;
     if (this.used < this.cap && i >= this.used) this.used = i + 1;
@@ -701,6 +824,9 @@ class TracerField {
     o = i * 4;
     const P = this.aParam.array;
     P[o] = len; P[o + 1] = now; P[o + 2] = 1 / life; P[o + 3] = speed;
+    o = i * 2;
+    const Y = this.aStyle.array;
+    Y[o] = wid; Y[o + 1] = trail;
     if (i < this._lo) this._lo = i;
     if (i > this._hi) this._hi = i;
   }
@@ -847,13 +973,28 @@ export class Combat {
     this.shells = new ShellPool(SHELL_CAP, this._rng.fork('shells'));
     scene.add(this.fxA.mesh, this.fxB.mesh, this.decals.mesh, this.tracers.mesh, this.shells.mesh);
 
-    // Added once and never toggled: changing a light's visibility changes the
-    // light count and recompiles every lit program in the scene.
-    this.flash = new THREE.PointLight(0xffcc88, 0, 11, 2.0);
+    // Added once at startup and NEVER toggled, added, removed or hidden. Any of
+    // those changes the scene's light count, which invalidates every lit
+    // program's #define block and recompiles the whole material set mid-frame.
+    // Only the intensity moves, and that is a uniform.
+    this.flash = new THREE.PointLight(0xffb46a, 0, 22, LIGHT_DECAY);
     this.flash.castShadow = false;
+    this.flash.matrixAutoUpdate = true;
     scene.add(this.flash);
     this._flashT = 0;
     this._flashPeak = 0;
+
+    // barrel heat: rises per round, bleeds off, drives the haze above the gun
+    this._heat = 0;
+    this._hazeT = 0;
+    this._muzzleObj = null;
+    this._ldx = 0; this._ldy = 0; this._ldz = -1;
+
+    // incoming fire
+    this._hrng = this._rng.fork('hostile');
+    this._lastEnemyShot = -1e9;
+    this._hostileShots = 0;
+    this._enemyMsg = { point: new THREE.Vector3(), dir: new THREE.Vector3(), distance: 0 };
 
     // ---- scratch (never reallocated). Must exist before the proxy cache is
     // built — _buildProxyCache borrows _v and _mw.
@@ -1088,9 +1229,10 @@ export class Combat {
     const mz = this._muzzleWorld(muzzle, origin, dx, dy, dz);
     this._muzzleFlash(mz.x, mz.y, mz.z, dx, dy, dz, cfg);
     this._ejectShell(muzzle, mz.x, mz.y, mz.z, dx, dy, dz);
+    if (muzzle && muzzle.isObject3D) this._muzzleObj = muzzle;
 
-    // --- tracer on roughly one round in three, deterministic per shot index
-    const tracer = (this.stats.shots % 3) === 1;
+    // --- one round in three is a loaded tracer; the rest leave a faint trail
+    const tracer = (this.stats.shots % 3) === 1 ? 2 : 1;
 
     // A round fired by anything other than the player gets full FX but never
     // damages the enemy list — otherwise AI crossfire would kill AI. Hostility
@@ -1101,7 +1243,13 @@ export class Combat {
     const mv = cfg.muzzleVelocity || 780;
     const instant = Math.min(45, Math.max(18, mv * 0.055));
     this._resolve(origin.x, origin.y, origin.z, dx, dy, dz, instant, cfg,
-      hostile ? -1 : 1, 0, 0, tracer, mz.x, mz.y, mz.z, mv);
+      hostile ? -1 : 1, 0, 0, hostile ? 3 : tracer, mz.x, mz.y, mz.z, mv);
+
+    // The exchange. Suppressive fire runs on its own clock in update(), but a
+    // round going out is the cue that most reliably produces one coming back,
+    // and it is the only way to guarantee that a frame containing the player's
+    // muzzle flash also contains somebody else's.
+    if (!hostile && this.time - this._lastEnemyShot > 0.006) this._returnFire();
   }
 
   /**
@@ -1115,7 +1263,9 @@ export class Combat {
     const dmgScale = hostile ? -signedScale : signedScale;
     const gT = this._castWorld(ox, oy, oz, dx, dy, dz, maxDist);
     const geoT = gT < 0 ? maxDist : gT;
-    const eh = this._castEnemies(ox, oy, oz, dx, dy, dz, geoT);
+    // Incoming fire passes through the people firing it. It carries no damage,
+    // so a hit test would only cost a cast and risk marking a false hitmarker.
+    const eh = hostile ? null : this._castEnemies(ox, oy, oz, dx, dy, dz, geoT);
 
     // bullet-crack whip for anything that passes close to the player
     this._maybeCrack(ox, oy, oz, dx, dy, dz, gT < 0 ? maxDist : gT, speed);
@@ -1130,7 +1280,7 @@ export class Combat {
       const py = eh.point ? eh.point.y : oy + dy * eh.distance;
       const pz = eh.point ? eh.point.z : oz + dz * eh.distance;
 
-      if (tracer) this._tracer(tox, toy, toz, px, py, pz, speed, true);
+      if (tracer) this._tracer(tox, toy, toz, px, py, pz, speed, true, tracer);
       this._impact('flesh', px, py, pz, -dx, -dy, -dz, dx, dy, dz, head ? 1.7 : 1.0);
       this.stats.hits++;
 
@@ -1170,7 +1320,7 @@ export class Combat {
       const dist = travelled + gT;
       const energy = Math.min(2.0, Math.max(0.45, (cfg.damage || 25) / 28)) * dmgScale;
 
-      if (tracer) this._tracer(tox, toy, toz, px, py, pz, speed, true);
+      if (tracer) this._tracer(tox, toy, toz, px, py, pz, speed, true, tracer);
       this._impact(surface, px, py, pz, hnx, hny, hnz, dx, dy, dz, energy);
       this._decal(surface, px, py, pz, hnx, hny, hnz, energy);
       this._emitHit(px, py, pz, hnx, hny, hnz, dx, dy, dz, dist, surface, null, false, 0, pens > 0);
@@ -1200,8 +1350,8 @@ export class Combat {
       const nextSigned = hostile ? -nextScale : nextScale;
       if (rest > 0.5) {
         this._resolve(ex + ndx * 0.01, ey + ndy * 0.01, ez + ndz * 0.01, ndx, ndy, ndz,
-          rest, cfg, nextSigned, travelled + hExit, pens + 1, false, ex, ey, ez, speed);
-      } else if (speed > 0) {
+          rest, cfg, nextSigned, travelled + hExit, pens + 1, 0, ex, ey, ez, speed);
+      } else if (speed > 0 && !hostile) {
         // penetrated on the last centimetres of a projectile substep: let the
         // round carry on as a projectile rather than vanishing inside the wall
         this._spawnProjectile(ex + ndx * 0.01, ey + ndy * 0.01, ez + ndz * 0.01,
@@ -1212,8 +1362,12 @@ export class Combat {
 
     // --- nothing inside the instant window: continue as a real projectile
     if (tracer) {
-      this._tracer(tox, toy, toz, ox + dx * 140, oy + dy * 140, oz + dz * 140, speed, false);
+      this._tracer(tox, toy, toz, ox + dx * 140, oy + dy * 140, oz + dz * 140, speed, false, tracer);
     }
+    // Suppressive fire is a readability system, not a simulation: resolving it
+    // as a projectile would put up to 32 slots of per-frame world casts on the
+    // budget for rounds that are already off camera and can never hit anything.
+    if (hostile) return;
     this._spawnProjectile(ox + dx * maxDist, oy + dy * maxDist, oz + dz * maxDist,
       dx * speed, dy * speed, dz * speed, cfg, signedScale, travelled + maxDist, pens);
   }
@@ -1274,7 +1428,7 @@ export class Combat {
         const px = P[o], py = P[o + 1], pz = P[o + 2];
         const scale = P[o + 6], trav = P[o + 7], pens = P[o + 8];
         P[o + 10] = 0; this._pjW[i] = null; this._pjLive--;
-        this._resolve(px, py, pz, dx, dy, dz, stepLen, cfg, scale, trav, pens, false, px, py, pz, sp);
+        this._resolve(px, py, pz, dx, dy, dz, stepLen, cfg, scale, trav, pens, 0, px, py, pz, sp);
         continue;
       }
       this._maybeCrack(P[o], P[o + 1], P[o + 2], dx, dy, dz, stepLen, sp);
@@ -1321,36 +1475,82 @@ export class Combat {
     return v;
   }
 
+  /**
+   * First-person muzzle flash. Six additive quads and one light, all of which
+   * exist from startup. The brightness numbers look absurd written down — a
+   * white core at 62 scene-linear against a sunlit wall at ~1.1 — and they are
+   * meant to: the filmic shoulder is an exponential asymptote, so anything under
+   * about 4.0 lands short of 250/255 and the frame still has no true white in it.
+   */
   _muzzleFlash(x, y, z, dx, dy, dz, cfg) {
     const r = this._rng, t = this.time;
-    const seed = r();
     const scale = 0.9 + (cfg.damage ? Math.min(1.5, cfg.damage / 30) : 1) * 0.35;
+    const L = FLASH_LIFE;
 
-    // two petal quads + a hot core; ~2 frames of life so it flickers, not glows
-    this.fxB.emit(x, y, z, dx * 1.2, dy * 1.2, dz * 1.2,
-      9.5, 5.2, 1.9, 0.30 * scale, 0.40 * scale, 0.038, 0, 6, 3, seed, t);
-    this.fxB.emit(x + dx * 0.05, y + dy * 0.05, z + dz * 0.05, dx * 2.4, dy * 2.4, dz * 2.4,
-      13.0, 7.5, 3.0, 0.16 * scale, 0.26 * scale, 0.028, 0, 6, 3, r(), t);
-    this.fxB.emit(x, y, z, 0, 0.2, 0,
-      6.0, 3.2, 1.1, 0.10 * scale, 0.05, 0.055, -0.4, 3, 0, r(), t);
+    // 1. The core. This is the pixel that clips, and it is the only thing in the
+    //    build that reaches display white on its own.
+    this.fxB.emit(x + dx * 0.02, y + dy * 0.02, z + dz * 0.02, 0, 0, 0,
+      62.0, 47.0, 34.0, 0.085 * scale, 0.105 * scale, L, 0, 6, 5, r(), t);
 
-    // a short spray of unburnt powder sparks
-    for (let i = 0; i < 5; i++) {
-      const sx = dx * (7 + r() * 9) + (r() - 0.5) * 3.2;
-      const sy = dy * (7 + r() * 9) + (r() - 0.5) * 3.2;
-      const sz = dz * (7 + r() * 9) + (r() - 0.5) * 3.2;
-      this.fxB.emit(x, y, z, sx, sy, sz, 7.0, 2.6, 0.55,
-        0.028, 0.006, 0.09 + r() * 0.06, 5.5, 5.0, 1, 0.05 + r() * 0.05, t);
+    // 2. Two star petals at different rolls and sizes. Unequal spokes: a
+    //    symmetric star reads as a sticker.
+    this.fxB.emit(x, y, z, 0, 0, 0,
+      22.0, 11.0, 3.4, 0.40 * scale, 0.46 * scale, L, 0, 6, 3, r(), t);
+    this.fxB.emit(x + dx * 0.03, y + dy * 0.03, z + dz * 0.03, 0, 0, 0,
+      13.0, 6.0, 1.7, 0.66 * scale, 0.74 * scale, L, 0, 6, 3, r(), t);
+
+    // 3. The gas cone down the bore. aVel carries the bore so the vertex shader
+    //    can lay the quad along it in screen space.
+    this.fxB.emit(x + dx * 0.03, y + dy * 0.03, z + dz * 0.03, dx, dy, dz,
+      16.0, 7.4, 2.1, 0.30 * scale, 0.34 * scale, L, 0, 6, 4, 0.3 + r() * 0.7, t);
+
+    // 4. A warm halo the bloom pyramid can grab, wider and much dimmer.
+    this.fxB.emit(x, y, z, 0, 0, 0,
+      3.4, 1.75, 0.62, 1.15 * scale, 1.30 * scale, L * 1.25, 0, 6, 5, r(), t);
+
+    // 5. Unburnt powder thrown clear of the muzzle. Long enough to survive the
+    //    flash itself, so the frame after the flash still has something in it.
+    for (let i = 0; i < 7; i++) {
+      const sx = dx * (7 + r() * 11) + (r() - 0.5) * 4.0;
+      const sy = dy * (7 + r() * 11) + (r() - 0.5) * 4.0 + 0.4;
+      const sz = dz * (7 + r() * 11) + (r() - 0.5) * 4.0;
+      this.fxB.emit(x, y, z, sx, sy, sz, 9.0, 3.2, 0.6,
+        0.030, 0.006, 0.10 + r() * 0.09, 6.5, 5.0, 1, 0.05 + r() * 0.05, t);
     }
 
-    // faint smoke, so sustained fire builds a haze at the muzzle
+    // 6. Smoke, so sustained fire builds a haze the flash then lights from inside.
     this.fxA.emit(x + dx * 0.1, y + dy * 0.1, z + dz * 0.1, dx * 1.6, dy * 1.6 + 0.35, dz * 1.6,
-      0.40, 0.38, 0.36, 0.06, 0.34, 0.42 + r() * 0.2, -0.5, 2.6, 0, r(), t);
+      0.62, 0.58, 0.54, 0.07, 0.40, 0.42 + r() * 0.22, -0.5, 2.6, 0, r(), t);
 
     this.flash.position.set(x, y, z);
-    this._flashPeak = 55 * scale;
-    this._flashT = 0.05;
+    this._flashPeak = LIGHT_PEAK * scale;
+    this._flashT = LIGHT_LIFE;
     this.flash.intensity = this._flashPeak;
+
+    this._heat = Math.min(1, this._heat + 0.085);
+    this._ldx = dx; this._ldy = dy; this._ldz = dz;
+  }
+
+  /**
+   * Enemy muzzle flash, seen from downrange. The near-field version is a shape;
+   * at 15m it is a blown-out point, so this is a bright core plus a halo big
+   * enough to survive the bloom downsample — the player has to be able to find
+   * a shooter in the 3D scene, not only on the compass.
+   */
+  _enemyFlash(x, y, z, dx, dy, dz) {
+    const r = this._hrng, t = this.time;
+    const L = FLASH_LIFE * 1.35;   // slightly longer: fewer pixels to be seen in
+    this.fxB.emit(x, y, z, 0, 0, 0,
+      44.0, 30.0, 17.0, 0.15, 0.19, L, 0, 6, 5, r(), t);
+    this.fxB.emit(x, y, z, 0, 0, 0,
+      15.0, 7.6, 2.4, 0.52, 0.60, L, 0, 6, 3, r(), t);
+    this.fxB.emit(x + dx * 0.05, y + dy * 0.05, z + dz * 0.05, dx, dy, dz,
+      9.0, 4.2, 1.2, 0.26, 0.30, L, 0, 6, 4, 0.3 + r() * 0.7, t);
+    // halo: this is what actually makes it findable across the street
+    this.fxB.emit(x, y, z, 0, 0, 0,
+      2.6, 1.35, 0.48, 1.05, 1.20, L * 1.3, 0, 6, 5, r(), t);
+    this.fxA.emit(x + dx * 0.12, y + dy * 0.12, z + dz * 0.12, dx * 1.1, 0.5, dz * 1.1,
+      0.55, 0.52, 0.48, 0.06, 0.42, 0.55, -0.35, 2.4, 0, r(), t);
   }
 
   _ejectShell(muzzle, mx, my, mz, dx, dy, dz) {
@@ -1374,6 +1574,11 @@ export class Combat {
     const vy = ry * (2.4 + r() * 1.1) + 1.35 + r() * 0.5;
     const vz = rz * (2.4 + r() * 1.1) + dz * 0.5 + (r() - 0.5) * 0.5;
     this.shells.spawn(px, py, pz, vx, vy, vz, floorY, this._lastFloorSurface);
+
+    // Port gas. The case leaves with a wisp of hot propellant on it, which is
+    // most of what sells brass in flight — a bare cylinder reads as a prop.
+    this.fxA.emit(px, py, pz, vx * 0.30, vy * 0.30 + 0.28, vz * 0.30,
+      0.52, 0.49, 0.46, 0.020, 0.085 + r() * 0.05, 0.24 + r() * 0.14, -0.5, 3.6, 0, r(), this.time);
   }
 
   _floorUnder(x, y, z) {
@@ -1383,13 +1588,33 @@ export class Combat {
     return this._hit.py;
   }
 
-  _tracer(x, y, z, tx, ty, tz, speed, clipped) {
+  /**
+   * A tracer with real travel time. `code`: 1 = the faint air-disturbance trail
+   * every round leaves, 2 = a loaded tracer round, 3 = incoming.
+   *
+   * Why every round gets something: one round in three is a tracer, but a
+   * firefight in which two rounds out of three leave no mark at all downrange
+   * reads as a gun that is not connected to the world. The 1-in-3 rounds are the
+   * ones you see as a streak of light; the rest are a thin, dim, short smear of
+   * disturbed air that you register without naming.
+   */
+  _tracer(x, y, z, tx, ty, tz, speed, clipped, code) {
     let dx = tx - x, dy = ty - y, dz = tz - z;
     const len = Math.hypot(dx, dy, dz) || 1;
     dx /= len; dy /= len; dz /= len;
-    const life = Math.min(0.42, 0.055 + len / Math.max(120, speed));
-    this.tracers.fire(x, y, z, dx, dy, dz, clipped ? len : 150,
-      Math.max(190, speed * 0.72), 5.6, 2.4, 0.7, life, this.time);
+    const vis = Math.max(210, speed * 0.72);
+    const flight = len / vis;
+    if (code === 3) {
+      // incoming: cooler and longer-burning, so "at me" is legible at a glance
+      this.tracers.fire(x, y, z, dx, dy, dz, clipped ? len : 170, vis,
+        1.6, 8.6, 2.6, Math.min(0.55, Math.max(0.24, 0.18 + flight)), this.time, 1.05, 22);
+    } else if (code === 2) {
+      this.tracers.fire(x, y, z, dx, dy, dz, clipped ? len : 170, vis,
+        7.8, 3.2, 0.90, Math.min(0.50, Math.max(0.20, 0.16 + flight)), this.time, 1.0, 16);
+    } else {
+      this.tracers.fire(x, y, z, dx, dy, dz, clipped ? len : 170, vis,
+        2.1, 0.95, 0.30, Math.min(0.26, Math.max(0.11, 0.09 + flight)), this.time, 0.5, 9);
+    }
   }
 
   /** Per-surface impact burst. Everything comes out of the two shared fields. */
@@ -1402,6 +1627,17 @@ export class Combat {
     const dot = dx * nx + dy * ny + dz * nz;
     const rxv = dx - 2 * dot * nx, ryv = dy - 2 * dot * ny, rzv = dz - 2 * dot * nz;
 
+    // The strike flash. Every impact gets one, tinted to the material, on the
+    // same hold-then-cliff curve as the muzzle flash. This is the thing that
+    // says "a round landed HERE" in the two frames before the dust has grown,
+    // and it is what was missing from every frame in the last set.
+    if (S.fx !== 'blood') {
+      const fk = S.fx === 'spark' ? 1.5 : S.fx === 'poof' ? 0.55 : 0.85;
+      this.fxB.emit(px + nx * 0.02, py + ny * 0.02, pz + nz * 0.02, 0, 0, 0,
+        S.dust[0] * 11.0 * fk, S.dust[1] * 9.0 * fk, S.dust[2] * 6.4 * fk,
+        0.075 * e, 0.10 * e, FLASH_LIFE, 0, 6, 5, r(), t);
+    }
+
     if (S.fx === 'spark') {
       const n = (S.sparks * e) | 0;
       for (let i = 0; i < n; i++) {
@@ -1412,12 +1648,10 @@ export class Combat {
           (jx / l) * sp, (jy / l) * sp, (jz / l) * sp,
           8.0, 2.9, 0.5, 0.030, 0.008, 0.16 + r() * 0.24, 9.0, 2.2, 1, 0.06 + r() * 0.06, t);
       }
-      // hot flash at the point of contact
-      this.fxB.emit(px + nx * 0.02, py + ny * 0.02, pz + nz * 0.02, 0, 0, 0,
-        6.5, 3.0, 0.9, 0.10 * e, 0.02, 0.05, 0, 6, 0, r(), t);
       // thin grey smoke off the strike
       this.fxA.emit(px + nx * 0.05, py + ny * 0.05, pz + nz * 0.05, nx * 0.5, ny * 0.5 + 0.5, nz * 0.5,
-        0.28, 0.27, 0.26, 0.05, 0.28 * e, 0.5, -0.6, 2.4, 0, r(), t);
+        0.28 * DUST_LIT, 0.27 * DUST_LIT, 0.26 * DUST_LIT,
+        0.09, 0.34 * e, 0.5, -0.6, 2.4, 0, r(), t);
     } else if (S.fx === 'blood') {
       const n = (7 * e) | 0;
       for (let i = 0; i < n; i++) {
@@ -1425,39 +1659,58 @@ export class Combat {
         const jx = dx * 0.6 + (r() - 0.5) * 1.5, jy = dy * 0.6 + (r() - 0.5) * 1.5 + 0.3, jz = dz * 0.6 + (r() - 0.5) * 1.5;
         const l = Math.hypot(jx, jy, jz) || 1;
         this.fxA.emit(px, py, pz, (jx / l) * sp, (jy / l) * sp, (jz / l) * sp,
-          S.dust[0], S.dust[1], S.dust[2],
-          0.035 + r() * 0.05, 0.12 + r() * 0.09 * e, 0.30 + r() * 0.16, 1.6, 3.4, 0, r(), t);
+          S.dust[0] * GORE_LIT, S.dust[1] * GORE_LIT, S.dust[2] * GORE_LIT,
+          0.045 + r() * 0.05, 0.13 + r() * 0.09 * e, 0.30 + r() * 0.16, 1.6, 3.4, 0, r(), t);
       }
       // one denser puff so the hit reads at range
       this.fxA.emit(px - dx * 0.05, py - dy * 0.05, pz - dz * 0.05, -dx * 0.8, -dy * 0.8 + 0.3, -dz * 0.8,
-        0.34, 0.035, 0.03, 0.06 * e, 0.30 * e, 0.24, 0.8, 3.0, 0, r(), t);
+        0.34 * GORE_LIT, 0.035 * GORE_LIT, 0.03 * GORE_LIT,
+        0.10 * e, 0.34 * e, 0.24, 0.8, 3.0, 0, r(), t);
     } else {
       // dust / poof / splinter / glass all share the puff+debris shape
-      const puffs = S.fx === 'poof' ? 3 : 4;
+      const puffs = S.fx === 'poof' ? 4 : 5;
       const rise = S.fx === 'poof' ? -0.15 : -0.9;   // negative gravity = it lifts
       const spd = S.fx === 'poof' ? 0.7 : 1.5;
       for (let i = 0; i < puffs; i++) {
         const jx = nx * (0.6 + r() * 0.9) + (r() - 0.5) * 0.85;
         const jy = ny * (0.6 + r() * 0.9) + (r() - 0.5) * 0.85;
         const jz = nz * (0.6 + r() * 0.9) + (r() - 0.5) * 0.85;
-        const k = 0.85 + r() * 0.4;
+        const k = (0.85 + r() * 0.4) * DUST_LIT;
+        // s0 is deliberately not tiny: a puff that starts as a dot spends its
+        // first three frames invisible, which is the window a shot is judged in.
         this.fxA.emit(px + nx * 0.03, py + ny * 0.03, pz + nz * 0.03,
           jx * spd * e, jy * spd * e, jz * spd * e,
           S.dust[0] * k, S.dust[1] * k, S.dust[2] * k,
-          0.05 + r() * 0.05, (0.34 + r() * 0.30) * e, 0.55 + r() * 0.45,
+          0.09 + r() * 0.06, (0.40 + r() * 0.34) * e, 0.62 + r() * 0.5,
           rise, 2.5, 0, r(), t);
       }
-      const chips = (S.chips * e) | 0;
+      // Spall: fragments of the surface, thrown off the ricochet vector and
+      // tumbling. These are what tell you the wall lost material.
+      const chips = ((S.chips + 2) * e) | 0;
       for (let i = 0; i < chips; i++) {
-        const sp = 2.2 + r() * 6.5 * e;
+        const sp = 2.6 + r() * 7.5 * e;
         const jx = rxv + (r() - 0.5) * 1.5, jy = ryv + (r() - 0.5) * 1.5 + 0.35, jz = rzv + (r() - 0.5) * 1.5;
         const l = Math.hypot(jx, jy, jz) || 1;
-        const k = 0.8 + r() * 0.5;
+        const k = (0.8 + r() * 0.5) * CHIP_LIT;
         this.fxA.emit(px + nx * 0.02, py + ny * 0.02, pz + nz * 0.02,
           (jx / l) * sp, (jy / l) * sp, (jz / l) * sp,
           S.chip[0] * k, S.chip[1] * k, S.chip[2] * k,
-          0.014 + r() * 0.016, 0.010 + r() * 0.012, 0.55 + r() * 0.6,
+          0.016 + r() * 0.020, 0.012 + r() * 0.014, 0.55 + r() * 0.6,
           GRAV, 0.35, 2, r(), t);
+      }
+      // A few grains catch the key light on the way out — the glint that stops
+      // spall reading as flat grey confetti.
+      if (S.fx !== 'poof') {
+        const g = (2 * e) | 0;
+        for (let i = 0; i < g; i++) {
+          const sp = 3.0 + r() * 7.0 * e;
+          const jx = rxv + (r() - 0.5) * 1.7, jy = ryv + (r() - 0.5) * 1.7 + 0.5, jz = rzv + (r() - 0.5) * 1.7;
+          const l = Math.hypot(jx, jy, jz) || 1;
+          this.fxB.emit(px + nx * 0.02, py + ny * 0.02, pz + nz * 0.02,
+            (jx / l) * sp, (jy / l) * sp, (jz / l) * sp,
+            S.chip[0] * 3.4, S.chip[1] * 3.2, S.chip[2] * 2.9,
+            0.013, 0.005, 0.22 + r() * 0.22, GRAV, 1.6, 1, 0.05 + r() * 0.05, t);
+        }
       }
       if (S.fx === 'glass') {
         // a couple of bright shards catching the key light
@@ -1497,6 +1750,151 @@ export class Combat {
       T[0], T[1], T[2], DECAL_LIFE, this.time);
   }
 
+  // -------------------------------------------------------------- hot barrel
+  /**
+   * Heat accumulates a round at a time and bleeds off over a couple of seconds.
+   * Above a third of full it puts a column of disturbed air over the gas block.
+   *
+   * This is not refraction — a real shimmer needs the scene colour behind it and
+   * this module does not own a screen-space pass. It is a stack of low-contrast
+   * banded lenses that rise, wobble and stretch, which is what the effect looks
+   * like once it has been through a lens and a tone curve anyway.
+   */
+  _updateBarrelHeat(dt) {
+    const h = this._heat;
+    if (h <= 0) return;
+    this._heat = Math.max(0, h - dt * (0.24 + 0.12 * h));
+    const mo = this._muzzleObj;
+    if (!mo || h < 0.30) return;
+
+    this._hazeT -= dt;
+    if (this._hazeT > 0) return;
+    this._hazeT = 0.055;
+
+    mo.updateWorldMatrix(true, false);
+    const e = mo.matrixWorld.elements;
+    const r = this._rng, t = this.time;
+    // back along the bore from the muzzle: that is where the barrel is
+    const back = 0.04 + r() * 0.30;
+    const hx = e[12] - this._ldx * back;
+    const hy = e[13] - this._ldy * back + 0.012;
+    const hz = e[14] - this._ldz * back;
+    this.fxA.emit(hx, hy, hz, (r() - 0.5) * 0.05, 0.17 + r() * 0.11, (r() - 0.5) * 0.05,
+      0.72, 0.68, 0.63, 0.022, 0.055 + 0.055 * h, 0.55 + r() * 0.45,
+      -0.06, 1.1, 6, r(), t);
+
+    // ...and once it is properly hot, the steel itself starts to glow.
+    if (h > 0.52) {
+      const g = (h - 0.52) * 2.1;
+      this.fxB.emit(e[12] - this._ldx * (0.05 + r() * 0.10), e[13] - this._ldy * 0.05,
+        e[14] - this._ldz * (0.05 + r() * 0.10), 0, 0, 0,
+        0.95 * g, 0.24 * g, 0.045 * g, 0.024, 0.024, 0.12, 0, 6, 5, r(), t);
+    }
+  }
+
+  // ----------------------------------------------------------- incoming fire
+  /**
+   * The hostile half of the exchange. ai.js closes and dies; it does not shoot,
+   * and a firefight frame with fire going only one way is a shooting range.
+   * These rounds do full ballistics — they hit walls, kick dust off the cover
+   * the player is behind, crack past the camera — and carry no damage at all.
+   */
+  _updateIncomingFire(dt) {
+    const list = this.world && this.world.enemies;
+    if (!list || !list.length || !this.world.player) return;
+    const r = this._hrng;
+    const n = list.length < 8 ? list.length : 8;
+    for (let i = 0; i < n; i++) {
+      const e = list[i];
+      if (!e || !e.alive || !e.ch) continue;
+      let st = e._cbFire;
+      // one small object per enemy at first sight, never per frame
+      if (!st) st = e._cbFire = { t: 0.3 + r() * 1.3, burst: 0 };
+      st.t -= dt;
+      if (st.t > 0) continue;
+      if (st.burst <= 0) st.burst = 3 + ((r() * 4) | 0);
+      st.burst--;
+      st.t = st.burst > 0 ? 0.075 + r() * 0.04 : 0.9 + r() * 1.2;
+      this._fireHostile(e);
+    }
+  }
+
+  /** Pick the best-framed shooter and have them answer the player's round. */
+  _returnFire() {
+    const list = this.world && this.world.enemies;
+    const p = this.world && this.world.player;
+    if (!list || !list.length || !p) return;
+    const pitch = p.pitch || 0, cp = Math.cos(pitch);
+    const fx = -Math.sin(p.yaw) * cp, fy = Math.sin(pitch), fz = -Math.cos(p.yaw) * cp;
+    let best = null, bestScore = 0;
+    for (let i = 0; i < list.length; i++) {
+      const e = list[i];
+      if (!e || !e.alive || !e.ch) continue;
+      const q = e.ch.group.position;
+      const ax = q.x - p.pos.x, ay = q.y + 1.3 - (p.pos.y + 1.68), az = q.z - p.pos.z;
+      const l = Math.hypot(ax, ay, az) || 1;
+      const facing = (ax * fx + ay * fy + az * fz) / l;
+      if (facing < 0.45) continue;          // behind the player: nothing to see
+      // in frame, and the longer since this one fired the better
+      const score = facing + Math.min(1.5, (this.time - (e._cbLast || -9)) * 0.6);
+      if (score > bestScore) { bestScore = score; best = e; }
+    }
+    if (best) this._fireHostile(best);
+  }
+
+  _fireHostile(e) {
+    const p = this.world && this.world.player;
+    if (!p) return;
+    const g = e.ch.group;
+    g.updateWorldMatrix(true, false);
+    const m = g.matrixWorld.elements;
+    // ai.js aims the group with lookAt, so its local +Z faces the player and
+    // local +X is the shooter's right — that puts the weapon where a weapon goes.
+    const fx = m[8], fy = m[9], fz = m[10];
+    const rx = m[0], ry = m[1], rz = m[2];
+    const q = g.position;
+    const mx = q.x + fx * 0.30 + rx * 0.15;
+    const my = q.y + 1.32 + fy * 0.30 + ry * 0.15;
+    const mz = q.z + fz * 0.30 + rz * 0.15;
+
+    let dx = p.pos.x - mx, dy = p.pos.y + 1.62 - my, dz = p.pos.z - mz;
+    const dist = Math.hypot(dx, dy, dz) || 1;
+    dx /= dist; dy /= dist; dz /= dist;
+
+    // Deliberate near-miss, sized in metres at the player's range and converted
+    // to an angle. They are suppressing, and a round that threads 80cm past the
+    // ear is the readable one — a round on target would just be a hitmarker the
+    // player never earned.
+    const r = this._hrng;
+    let ux = -dz, uy = 0, uz = dx;
+    const ul = Math.hypot(ux, uy, uz) || 1;
+    ux /= ul; uy /= ul; uz /= ul;
+    const wx = dy * uz - dz * uy, wy = dz * ux - dx * uz, wz = dx * uy - dy * ux;
+    const side = (r() < 0.5 ? -1 : 1) * (0.5 + r() * 1.9) / dist;
+    const vert = ((r() - 0.5) * 2.6) / dist;
+    dx += ux * side + wx * vert; dy += uy * side + wy * vert; dz += uz * side + wz * vert;
+    const l = Math.hypot(dx, dy, dz) || 1;
+    dx /= l; dy /= l; dz /= l;
+
+    this._enemyFlash(mx, my, mz, dx, dy, dz);
+    this._lastEnemyShot = this.time;
+    e._cbLast = this.time;
+    this._hostileShots++;
+
+    const msg = this._enemyMsg;
+    msg.point.set(mx, my, mz);
+    msg.dir.set(dx, dy, dz);
+    msg.distance = dist;
+    bus.emit(EV_ENEMY_FIRE, msg);
+
+    // Every second incoming round is a visible tracer: enough for the player to
+    // read the line back to the shooter, not so many that the street is a laser
+    // show and nothing stands out.
+    const tracer = (this._hostileShots & 1) === 0 ? 3 : 0;
+    this._resolve(mx, my, mz, dx, dy, dz, HOSTILE_RANGE, HOSTILE, -0.9, 0, 0,
+      tracer, mx, my, mz, HOSTILE_SPEED);
+  }
+
   // ------------------------------------------------------------------ frame
   update(dt) {
     this.time += dt;
@@ -1506,13 +1904,22 @@ export class Combat {
     const rc = this.level?.raycastables;
     if (rc && rc.length !== this._proxyN) this._buildProxyCache();
 
+    // Bounce light. Holds at full for the flash's visible life and then falls
+    // off hard — a flash that eases out over 100ms reads as a lantern, and a
+    // flash that has already decayed 90% by the second frame (which is what the
+    // old exponential did) never appears in a screenshot at all.
     if (this._flashT > 0) {
       this._flashT -= dt;
-      const u = Math.max(0, this._flashT / 0.05);
-      this.flash.intensity = this._flashPeak * u * u;
-      if (this._flashT <= 0) this.flash.intensity = 0;
+      if (this._flashT <= 0) { this._flashT = 0; this.flash.intensity = 0; }
+      else if (this._flashT >= LIGHT_HOLD) this.flash.intensity = this._flashPeak;
+      else {
+        const u = this._flashT / LIGHT_HOLD;
+        this.flash.intensity = this._flashPeak * u * u;
+      }
     }
 
+    this._updateBarrelHeat(dt);
+    this._updateIncomingFire(dt);
     this._stepProjectiles(dt);
 
     this.shells.update(dt, this._onShellLand || (this._onShellLand =
@@ -1522,6 +1929,13 @@ export class Combat {
         m.surface = surface;
         m.energy = energy;
         bus.emit(EV_SHELL, m);
+        // brass landing lifts a little of whatever it landed in
+        const S = SURF[surface] || SURF.sand;
+        const r = this._rng;
+        const k = DUST_LIT * (0.7 + r() * 0.3);
+        this.fxA.emit(x, y + 0.012, z, (r() - 0.5) * 0.35, 0.16 + r() * 0.14, (r() - 0.5) * 0.35,
+          S.dust[0] * k, S.dust[1] * k, S.dust[2] * k,
+          0.020, 0.055 + 0.05 * energy, 0.34 + r() * 0.2, -0.2, 3.0, 0, r(), this.time);
       }));
 
     this.fxA.flush();
