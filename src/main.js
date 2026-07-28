@@ -128,6 +128,57 @@ window.__game = {
   setPaused(v) { benchState.paused = v; },
 };
 
+// ---------------------------------------------------------------- self-benchmark
+// The build machine has no GPU, so the only trustworthy 1080p/60 measurement is the
+// one the player takes on their own laptop. This makes that a single keypress.
+const selfBench = {
+  running: false, t0: 0, frames: 0, samples: [], result: null,
+  start() {
+    if (this.running) return;
+    this.running = true; this.t0 = performance.now(); this.frames = 0; this.samples = [];
+    this.result = null;
+    bus.emit(EV.UI, { kind: 'benchStart' });
+  },
+  tick(frameMs) {
+    if (!this.running) return;
+    this.frames++;
+    if (this.frames > 30) this.samples.push(frameMs); // discard warm-up
+    if (performance.now() - this.t0 > 20000) this.finish();
+  },
+  finish() {
+    this.running = false;
+    const s = this.samples.slice().sort((a, b) => a - b);
+    if (!s.length) return;
+    const at = (p) => s[Math.min(s.length - 1, Math.floor(p * s.length))];
+    this.result = {
+      avgFps: +(1000 / (s.reduce((a, b) => a + b, 0) / s.length)).toFixed(1),
+      onePercentLowFps: +(1000 / at(0.99)).toFixed(1),
+      medianMs: +at(0.5).toFixed(2),
+      width: pipeline.width, height: pipeline.height,
+      renderScale: +perf.renderScale.toFixed(3),
+      quality: perf.quality,
+      drawCalls: perf.stats.calls, triangles: perf.stats.triangles,
+      gpu: (() => {
+        try {
+          const gl = pipeline.renderer.getContext();
+          const d = gl.getExtension('WEBGL_debug_renderer_info');
+          return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : 'unknown';
+        } catch { return 'unknown'; }
+      })(),
+    };
+    bus.emit(EV.UI, { kind: 'benchResult', result: this.result });
+    console.log('[benchmark]', this.result);
+  },
+};
+window.__selfBench = selfBench;
+
+if (!BENCH) {
+  addEventListener('keydown', (e) => {
+    if (e.code === 'KeyB' && e.shiftKey) selfBench.start();
+    if (e.code === 'KeyF' && e.shiftKey) bus.emit(EV.UI, { kind: 'togglePerf' });
+  });
+}
+
 // ---------------------------------------------------------------- loop
 let last = performance.now();
 
@@ -156,6 +207,7 @@ function frame(now) {
   pipeline.render(scene, camera, dt);
   pipeline.reportCost(perf);
   perf.endFrame(performance.now());
+  selfBench.tick(perf.frameMs);
   benchState.frames++;
 }
 
