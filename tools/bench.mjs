@@ -27,6 +27,7 @@ import { spawn } from 'node:child_process';
 const ROOT = resolve(import.meta.dirname, '..');
 const DIST = join(ROOT, 'dist');
 const CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+const FFMPEG = '/opt/pw-browsers/ffmpeg-1011/ffmpeg-linux';
 const PORT = 4319;
 
 const args = process.argv.slice(2);
@@ -156,6 +157,7 @@ async function main() {
     : await page.evaluate(() => Object.keys(window.__game.shots));
 
   for (const name of names) {
+   try {
     process.stdout.write(`› shot ${name}… `);
     await page.goto(url(`w=1920&h=1080&shot=${name}`), { waitUntil: 'domcontentloaded' });
     await waitReady();
@@ -166,8 +168,19 @@ async function main() {
     }));
     const file = join(outDir, `${name}.png`);
     await page.screenshot({ path: file, timeout: 180000, caret: 'initial' });
-    result.shots[name] = `shots/r${String(round).padStart(2, '0')}/${name}.png`;
+    // A 960px JPEG alongside the archival PNG: this is what the progress page and
+    // the phone-facing artifact embed, so the page stays light over many rounds.
+    await run(FFMPEG, ['-y', '-loglevel', 'error', '-i', file, '-vf', 'scale=960:-1',
+                       '-q:v', '5', join(outDir, `${name}.jpg`)]).catch(() => {});
+    result.shots[name] = `shots/r${String(round).padStart(2, '0')}/${name}.jpg`;
+    result.shotsFull = result.shotsFull || {};
+    result.shotsFull[name] = `shots/r${String(round).padStart(2, '0')}/${name}.png`;
     console.log('ok');
+   } catch (e) {
+    // One bad pose must not cost us the whole round's data.
+    console.log('FAILED: ' + String(e.message).split('\n')[0]);
+    errors.push(`shot ${name}: ${String(e.message).slice(0, 200)}`);
+   }
   }
 
   await browser.close();
