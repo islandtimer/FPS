@@ -1036,6 +1036,7 @@ export class Combat {
     // incoming fire
     this._hrng = this._rng.fork('hostile');
     this._lastEnemyShot = -1e9;
+    this._lastPlayerShot = -1e9;
     this._hostileShots = 0;
     this._enemyMsg = { point: new THREE.Vector3(), dir: new THREE.Vector3(), distance: 0 };
 
@@ -1291,6 +1292,8 @@ export class Combat {
     const instant = Math.min(45, Math.max(18, mv * 0.055));
     this._resolve(origin.x, origin.y, origin.z, dx, dy, dz, instant, cfg,
       hostile ? -1 : 1, 0, 0, hostile ? 3 : tracer, mz.x, mz.y, mz.z, mv);
+
+    if (!hostile) this._lastPlayerShot = this.time;
 
     // The exchange. Suppressive fire runs on its own clock in update(), but a
     // round going out is the cue that most reliably produces one coming back,
@@ -1903,6 +1906,11 @@ export class Combat {
   _updateIncomingFire(dt) {
     const list = this.world && this.world.enemies;
     if (!list || !list.length || !this.world.player) return;
+    // Suppression follows contact. Enemies engage a player who is engaging them
+    // and keep it up for a couple of seconds after; they do not spray a street
+    // at someone standing quietly in it. This also keeps the poses that are not
+    // about combat — a close material read, an interior — free of my dust.
+    if (this.time - this._lastPlayerShot > 2.0) return;
     const r = this._hrng;
     const n = list.length < 8 ? list.length : 8;
     for (let i = 0; i < n; i++) {
