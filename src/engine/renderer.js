@@ -10,12 +10,22 @@
 //
 // SHAPE OF THE FRAME
 //   scene -> HDR RGBA16F target (+ 24bit depth texture)
-//   half-res SSAO from depth (normals reconstructed, no extra geometry pass)
+//   half-res SSAO from depth (normals reconstructed, no extra geometry pass);
+//     wide room-scale term * tight ~0.15m contact term, both in the one pass
 //   TAA resolve (Halton jitter, world-space reprojection, YCoCg variance clip)
-//   64x36 -> 1x1 log-luminance chain for GPU-side eye adaptation (no readback)
+//   64x36 -> 1x1 luminance chain for GPU-side eye adaptation (no readback),
+//     carrying both a log mean and a clamped linear mean
 //   dual-filter (Kawase) bloom pyramid off the resolved HDR image
-//   one composite pass: CA, sharpen, bloom, exposure, filmic curve, grade,
-//   vignette, grain, sRGB + dither
+//   one composite pass: CA, sharpen, bloom, exposure, filmic curve, vignette,
+//     sRGB, display-referred grade, grain + dither
+//
+// TONE — the intended reading of a frame, and what the numbers mean
+//   sunlit diffuse plaster   ~0.82 sRGB, with its own texture spanning ~0.74-0.90
+//   one stop above that      ~0.94, still separated
+//   shadowed interior surface <=0.06, and true zero where there is no light
+//   The curve's shoulder must never be reached by an ordinary lit wall; that is
+//   what turns plaster into paper. Auto-exposure is deliberately PARTIAL, so a
+//   dark interior stays darker on screen than the exterior in its doorway.
 //
 // Everything above is either full-res-cheap or half-res-or-smaller. Measured
 // full-screen pass equivalents (see reportCost, which computes this from the
@@ -54,7 +64,13 @@ const LUMA = /* glsl */ `
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }`;
 
 // ---------------------------------------------------------------------------
-// SSAO — half res, hemisphere kernel, normals from depth derivatives
+// SSAO — half res, hemisphere kernel, normals from depth derivatives.
+// Two radii in the one pass: a wide term for room-scale corners and a tight
+// contact term at ~0.15m. Wide-only AO measured a mean of 249/255 over the
+// whole buffer with 1.3% of texels below 160 — technically present, invisible
+// on screen. Contact darkening is what the eye actually reads as "this object
+// is resting on that surface", and it lives at a radius the wide kernel steps
+// straight over.
 // ---------------------------------------------------------------------------
 
 const AO_FRAG = /* glsl */ `
@@ -65,8 +81,11 @@ uniform mat4 uProj;
 uniform vec2 uTexel;      // 1 / half-res size
 uniform vec3 uKernel[16];
 uniform float uRadius;
+uniform float uRadius2;
 uniform float uBias;
+uniform float uBias2;
 uniform float uIntensity;
+uniform float uIntensity2;
 uniform float uFrame;
 ${RECONSTRUCT}
 
@@ -75,6 +94,27 @@ float depthAt(vec2 uv) { return texture2D(tDepth, uv).x; }
 // Interleaved gradient noise: cheap, and its structure is the one TAA eats best.
 float ign(vec2 p) {
   return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+// Tangent frame around n, rotated by a so the two radii sample decorrelated
+// directions and their noise does not stack into a single visible pattern.
+mat3 basis(vec3 n, float a) {
+  vec3 rv = vec3(cos(a), sin(a), 0.0);
+  vec3 t = normalize(rv - n * dot(rv, n));
+  return mat3(t, cross(n, t), n);
+}
+
+// One hemisphere sample: is the depth buffer in front of where this sample
+// point sits? the range term rejects an occluder that is so much nearer than p that
+// it is a separate object rather than a fold in the same surface.
+float occAt(vec3 p, vec3 sp, float radius, float bias) {
+  vec4 off = uProj * vec4(sp, 1.0);
+  vec2 suv = (off.xy / off.w) * 0.5 + 0.5;
+  if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) return 0.0;
+  vec3 sPos = viewPosFromDepth(suv, depthAt(suv));
+  float dz = sPos.z - sp.z;                          // view z is negative forward
+  float range = smoothstep(0.0, 1.0, radius / max(1e-4, abs(p.z - sPos.z)));
+  return step(bias, dz) * range;
 }
 
 void main() {
@@ -95,33 +135,42 @@ void main() {
   vec3 n = normalize(cross(ddx, ddy));
 
   float ang = ign(gl_FragCoord.xy + uFrame * 5.588238) * 6.2831853;
-  vec3 rv = vec3(cos(ang), sin(ang), 0.0);
-  vec3 t = normalize(rv - n * dot(rv, n));
-  vec3 b = cross(n, t);
-  mat3 tbn = mat3(t, b, n);
+  mat3 tbn = basis(n, ang);
 
   // Constant world-space radius: contact darkening is a physical near-field
   // effect and must not change scale as the player walks toward a corner.
-  float radius = uRadius;
-
   float occ = 0.0;
   for (int i = 0; i < SAMPLES; i++) {
-    vec3 sp = p + (tbn * uKernel[i]) * radius;
-    vec4 off = uProj * vec4(sp, 1.0);
-    vec2 suv = (off.xy / off.w) * 0.5 + 0.5;
-    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;
-    float sd = depthAt(suv);
-    vec3 sPos = viewPosFromDepth(suv, sd);
-    float dz = sPos.z - sp.z;                        // view z is negative forward
-    float range = smoothstep(0.0, 1.0, radius / max(1e-4, abs(p.z - sPos.z)));
-    occ += step(uBias, dz) * range;
+    occ += occAt(p, p + (tbn * uKernel[i]) * uRadius, uRadius, uBias);
   }
-  float ao = 1.0 - (occ / float(SAMPLES)) * uIntensity;
-  gl_FragColor = vec4(clamp(ao, 0.0, 1.0), 0.0, 0.0, 1.0);
+  float aoWide = 1.0 - (occ / float(SAMPLES)) * uIntensity;
+
+  // Tight contact term. Below ~1 half-res texel the kernel collapses inside a
+  // single depth sample and returns nothing but quantisation noise, so fade it
+  // out with distance rather than letting it dither the far field.
+  float mPerTexel = (2.0 * abs(p.z) * uTexel.x) / max(1e-5, uProj[0][0]);
+  float tight = smoothstep(1.0, 2.6, uRadius2 / max(1e-5, mPerTexel));
+  float aoTight = 1.0;
+  if (tight > 0.0) {
+    mat3 tbn2 = basis(n, ang + 2.3999632);          // golden angle apart
+    float occ2 = 0.0;
+    for (int i = 0; i < SAMPLES2; i++) {
+      occ2 += occAt(p, p + (tbn2 * uKernel[i]) * uRadius2, uRadius2, uBias2);
+    }
+    aoTight = 1.0 - (occ2 / float(SAMPLES2)) * uIntensity2 * tight;
+  }
+
+  // Multiplicative: a crease that is both room-occluded and in contact goes
+  // properly dark, which is exactly the wall/floor seam and the base of a prop.
+  gl_FragColor = vec4(clamp(aoWide * aoTight, 0.0, 1.0), 0.0, 0.0, 1.0);
 }`;
 
-// Depth-aware cross blur, half res. 8 taps, separable-ish in one go — the AO is
-// already low frequency so a wider kernel buys nothing.
+// Depth-aware cross blur, half res. 8 taps, separable-ish in one go — the wide
+// AO is low frequency so a wider kernel buys nothing, and the contact term must
+// not be blurred off the seam it belongs to. uDepthSigma is quoted against raw
+// window depth, which is linear in 1/z: at the previous 900 the weight for a
+// 0.15m step at 10m was exp(-0.07) = 0.93, i.e. no edge stop at all, and contact
+// darkening bled straight across every silhouette.
 const AO_BLUR_FRAG = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
@@ -163,6 +212,7 @@ uniform sampler2D tHist;
 uniform sampler2D tDepth;
 uniform sampler2D tAO;
 uniform mat4 uInvViewProj;   // inverse of THIS frame's jittered view-projection
+uniform mat4 uCurViewProj;   // THIS frame's UN-jittered view-projection
 uniform mat4 uPrevViewProj;  // LAST frame's un-jittered view-projection
 uniform vec2 uTexel;
 uniform float uFeedback;
@@ -228,7 +278,20 @@ void main() {
   vec4 wp = uInvViewProj * vec4(duv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
   wp /= wp.w;
   vec4 pp = uPrevViewProj * wp;
-  vec2 prevUv = (pp.xy / pp.w) * 0.5 + 0.5;
+  vec4 cp = uCurViewProj * wp;
+
+  // A motion vector is a DIFFERENCE, and it has to be measured between two
+  // un-jittered projections. Reading the reprojected position directly was
+  // wrong twice over: (1) duv is a NEIGHBOUR's uv whenever the closest-depth
+  // search moved off centre, so every silhouette pixel — every Picatinny slot
+  // edge — sampled its history one texel to the side, permanently, and could
+  // never converge; (2) unprojecting through the jittered matrix and projecting
+  // through the un-jittered one leaks the jitter into the lookup, so even a
+  // dead-still camera resampled its own history through a wandering ±0.5px
+  // bilinear tap every frame. Taking the difference cancels both: static camera
+  // now gives exactly zero motion.
+  vec2 motion = (pp.xy / pp.w) * 0.5 - (cp.xy / cp.w) * 0.5;
+  vec2 prevUv = vUv + motion;
 
   vec3 histY = toYCoCg(texture2D(tHist, prevUv).rgb);
 
@@ -267,6 +330,11 @@ void main() {
 // eye adaptation: 64x36 log-luma, then 1x1 with temporal hysteresis
 // ---------------------------------------------------------------------------
 
+// R = log2 luma (geometric mean; robust, but blind to how much highlight the
+// frame contains). G = clamped linear luma (arithmetic mean; highlight-led, so
+// a frame with a bright sky in it meters brighter and gets stopped down).
+// Blending the two is what stops a view into the sun from blowing out while
+// still letting a genuinely dim room open up.
 const LUM_FRAG = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
@@ -278,7 +346,9 @@ void main() {
          + texture2D(tColor, vUv + vec2( uTexel.x,  uTexel.y)).rgb
          + texture2D(tColor, vUv + vec2(-uTexel.x,  uTexel.y)).rgb
          + texture2D(tColor, vUv + vec2( uTexel.x, -uTexel.y)).rgb;
-  gl_FragColor = vec4(log2(max(luma(c * 0.25), 1e-4)), 0.0, 0.0, 1.0);
+  float l = luma(c * 0.25);
+  // Clamped so one muzzle flash or sun disc cannot drag the whole key with it.
+  gl_FragColor = vec4(log2(max(l, 1e-4)), min(l, 8.0), 0.0, 1.0);
 }`;
 
 const ADAPT_FRAG = /* glsl */ `
@@ -287,8 +357,10 @@ varying vec2 vUv;
 uniform sampler2D tLum;
 uniform sampler2D tPrev;
 uniform float uRate;
+uniform float uHiBias;      // 0 = geometric mean, 1 = arithmetic mean
+uniform float uDeadband;    // stops of slack before the eye moves at all
 void main() {
-  float sum = 0.0;
+  vec2 sum = vec2(0.0);
   // Centre-weighted: what the player is looking at should drive the exposure,
   // not a bright sliver of sky in the corner.
   float wsum = 0.0;
@@ -296,13 +368,48 @@ void main() {
     for (int x = 0; x < 8; x++) {
       vec2 uv = (vec2(float(x), float(y)) + 0.5) / vec2(8.0, 6.0);
       float w = 1.0 - 0.6 * length(uv - 0.5) * 1.4142;
-      sum += texture2D(tLum, uv).r * w;
+      sum += texture2D(tLum, uv).rg * w;
       wsum += w;
     }
   }
-  float cur = sum / wsum;
+  float cur = mix(sum.x / wsum, log2(max(sum.y / wsum, 1e-4)), uHiBias);
   float prev = texture2D(tPrev, vec2(0.5)).r;
-  gl_FragColor = vec4(mix(prev, cur, uRate), 0.0, 0.0, 1.0);
+
+  // Hysteresis, not just smoothing: inside the deadband the eye does not move
+  // at all, so a flickering muzzle flash or a stripe of sky crossing the centre
+  // weight cannot pump the exposure. Outside it, the deadband is subtracted so
+  // the response is continuous at the threshold instead of stepping.
+  float d = cur - prev;
+  float target = cur;
+  if (uRate < 0.999) {
+    target = abs(d) <= uDeadband ? prev : cur - sign(d) * uDeadband;
+  }
+  gl_FragColor = vec4(mix(prev, target, uRate), 0.0, 0.0, 1.0);
+}`;
+
+// Shared by the bloom prefilter and the composite so the bloom threshold is
+// measured against exactly the exposure the image is finished at.
+//
+// uAdaptStrength < 1 is the whole point: a fully normalising auto-exposure
+// maps every scene to the same mid-grey, which is precisely how an interior
+// ends up out-reading the sunlit exterior framed in its own doorway. Partial
+// adaptation keeps a fixed share of the real luminance difference on screen,
+// which is what an eye does.
+const EXPOSURE = /* glsl */ `
+uniform sampler2D tAdapt;
+uniform float uExposure;
+uniform float uAutoKey;
+uniform float uAutoMin;
+uniform float uAutoMax;
+uniform float uAdaptRef;
+uniform float uAdaptStrength;
+float sceneExposure() {
+  float ex = uExposure;
+#ifdef USE_AUTOEXP
+  float a = mix(uAdaptRef, texture2D(tAdapt, vec2(0.5)).r, uAdaptStrength);
+  ex *= clamp(uAutoKey * exp2(-a), uAutoMin, uAutoMax);
+#endif
+  return ex;
 }`;
 
 // ---------------------------------------------------------------------------
@@ -313,15 +420,11 @@ const PREFILTER_FRAG = /* glsl */ `
 precision highp float;
 varying vec2 vUv;
 uniform sampler2D tColor;
-uniform sampler2D tAdapt;
 uniform vec2 uTexel;
 uniform float uThreshold;
 uniform float uKnee;
-uniform float uExposure;
-uniform float uAutoKey;
-uniform float uAutoMin;
-uniform float uAutoMax;
 ${LUMA}
+${EXPOSURE}
 
 vec3 tap(vec2 uv) { return max(vec3(0.0), texture2D(tColor, uv).rgb); }
 
@@ -341,11 +444,7 @@ void main() {
   vec3 c = (c0 * w0 * 2.0 + c1 * w1 + c2 * w2 + c3 * w3 + c4 * w4) /
            (w0 * 2.0 + w1 + w2 + w3 + w4);
 
-  float ex = uExposure;
-#ifdef USE_AUTOEXP
-  ex *= clamp(uAutoKey / max(1e-4, exp2(texture2D(tAdapt, vec2(0.5)).r)), uAutoMin, uAutoMax);
-#endif
-  c *= ex;
+  c *= sceneExposure();
 
   // Soft knee so a surface easing past the threshold doesn't pop.
   float br = max(c.r, max(c.g, c.b));
@@ -400,12 +499,7 @@ varying vec2 vUv;
 uniform sampler2D tColor;
 uniform sampler2D tBloom;
 uniform sampler2D tAO;
-uniform sampler2D tAdapt;
 uniform vec2 uTexel;
-uniform float uExposure;
-uniform float uAutoKey;
-uniform float uAutoMin;
-uniform float uAutoMax;
 uniform float uBloom;
 uniform float uAoStrength;
 uniform float uVignette;
@@ -419,18 +513,32 @@ uniform float uGammaGrade;
 uniform float uSaturation;
 uniform float uContrast;
 ${LUMA}
+${EXPOSURE}
 
 vec3 fetch(vec2 uv) { return max(vec3(0.0), texture2D(tColor, uv).rgb); }
 
 // Uchimura's generalised filmic curve. Chosen over ACES because the toe, the
 // linear section and the shoulder are independently controllable, and the
 // shoulder is an exponential asymptote to the peak — it cannot hard-clip.
+//
+// Retuned for a working shoulder. The shoulder's decay constant is
+// a*P/(P-S1), and with the old a=1.06 / m=0.21 / l=0.36 it was 2.10 per unit
+// of scene linear: at the working exposure a sunlit plaster wall landed at
+// 0.87 sRGB and everything half a stop above it piled onto the same paper-white
+// value, which is where the crack detail went. A lower linear slope and a much
+// shorter linear section drop that constant to 0.875, which puts a sunlit
+// diffuse white at 0.82 with 46 display levels still above it instead of 15.
+// Doubling the toe curvature takes the darks to actual black rather than
+// easing them off a pedestal.
+// Measured, post-exposure scene linear -> 8-bit sRGB:
+//   0.005 -> 2 | 0.05 -> 55 | 0.21 -> 116 | 0.42 -> 152 | 1.01 -> 209
+//   +1 stop over white -> 238 | +2 -> 252
 float curve(float x) {
   const float P = 1.0;    // peak
-  const float a = 1.06;   // linear slope
-  const float m = 0.21;   // linear section start
-  const float l = 0.36;   // linear section length
-  const float c = 1.28;   // toe curvature
+  const float a = 0.74;   // linear slope
+  const float m = 0.11;   // linear section start
+  const float l = 0.05;   // linear section length
+  const float c = 2.0;    // toe curvature
   const float b = 0.0;    // toe pedestal
   float l0 = ((P - m) * l) / a;
   float S0 = m + l0;
@@ -520,7 +628,10 @@ void main() {
   vec3 blur = (fetch(vUv + vec2(uTexel.x, 0.0)) + fetch(vUv - vec2(uTexel.x, 0.0))
              + fetch(vUv + vec2(0.0, uTexel.y)) + fetch(vUv - vec2(0.0, uTexel.y))) * 0.25;
   vec3 delta = c - blur;
-  c += clamp(delta, -0.35, 0.35) * uSharpen;
+  // Tighter clamp than before. This runs on scene-linear HDR, where the delta
+  // across a rail slot is huge, so a loose clamp let the mask rebuild the exact
+  // hard step TAA had just resolved.
+  c += clamp(delta, -0.22, 0.22) * uSharpen;
   c = max(c, vec3(0.0));
 #endif
 
@@ -533,23 +644,27 @@ void main() {
   c += texture2D(tBloom, vUv).rgb * uBloom;
 #endif
 
-  float ex = uExposure;
-#ifdef USE_AUTOEXP
-  ex *= clamp(uAutoKey / max(1e-4, exp2(texture2D(tAdapt, vec2(0.5)).r)), uAutoMin, uAutoMax);
-#endif
-  c *= ex;
+  c *= sceneExposure();
 
   c = filmic(c);
 
-  // Display-referred grade: lift/gamma/gain, then a soft S on the midtones.
+  // Vignette belongs here, in scene-referred linear, because that is where a
+  // lens loses the light.
+  c *= 1.0 - uVignette * smoothstep(0.12, 0.72, r2);
+
+  c = srgb(c);
+
+  // The grade is DISPLAY-referred and therefore has to run after the transfer
+  // function. It used to run before it, and that single line was the reason
+  // nothing in the game had a black in it: a lift of 0.0135 on blue looks
+  // negligible written down, but the sRGB encode has a slope of ~12 near zero,
+  // so it landed as a 31/255 pedestal on blue and a 22/255 floor on luma. Every
+  // frame in the set bottomed out at exactly 22 and no darker. In display units
+  // the same numbers mean what they say.
   c = pow(max(c, vec3(0.0)), vec3(uGammaGrade));
   c = c * uGain + uLift * (1.0 - c);
   c = mix(c, c * c * (3.0 - 2.0 * c), uContrast);
-
-  float vig = 1.0 - uVignette * smoothstep(0.12, 0.72, r2);
-  c *= vig;
-
-  c = srgb(c);
+  c = clamp(c, 0.0, 1.0);
 
 #ifdef USE_GRAIN
   // Grain goes on AFTER the transfer function. Added in linear it would be
@@ -576,6 +691,26 @@ const TIERS = {
   high:   { taa: true,  fxaa: false, ao: true,  aoBlur: true,  aoSamples: 10, bloom: true,  mips: 5, ca: true,  grain: true,  sharpen: true,  autoExp: true,  shadow: 2048, bloomStrength: 0.062 },
   ultra:  { taa: true,  fxaa: false, ao: true,  aoBlur: true,  aoSamples: 16, bloom: true,  mips: 6, ca: true,  grain: true,  sharpen: true,  autoExp: true,  shadow: 2048, bloomStrength: 0.065 },
 };
+
+// Auto-exposure calibration, shared by the prefilter and the composite.
+//
+//   ref      log2 of the metered key of the reference scene. At exactly this
+//            reading the auto multiplier is 1.0 and `exposure` acts alone.
+//   strength how much of a scene's deviation from ref is cancelled. 1.0 is a
+//            light meter and flattens the whole game to one value; 0 is fixed
+//            exposure. At 0.55 an interior keeps 45% more of its real
+//            luminance difference from the exterior than a full meter would,
+//            which is what makes an interior read as an interior.
+//   min/max  3.7 stops of authority, wide enough that the clamp is a safety
+//            rail rather than the thing setting the exposure. The old
+//            0.5..2.2 was reached in normal play.
+const AUTO = { key: 0.17, ref: -2.2, strength: 0.55, min: 0.28, max: 3.6 };
+
+// Exponential time constant of the adaptation, in seconds. Long enough that
+// walking past a doorway is a visible settle rather than a step, short enough
+// that a player who turns into a dark room is not blind for a firefight. The
+// deadband in ADAPT_FRAG is what actually stops it pumping; this sets the pace.
+const ADAPT_TAU = 0.8;
 
 // Halton(2,3) — the standard low-discrepancy jitter. 8 phases is enough to fill
 // a pixel evenly without stretching the history so far that it ghosts.
@@ -618,7 +753,13 @@ export class RenderPipeline {
     this.rtHeight = 0;
 
     // Controllable grade knobs (public: other tooling may poke these).
-    this.exposure = 1.0;
+    // The base multiplier places a sunlit diffuse surface just onto the curve's
+    // shoulder rather than deep into it; auto-exposure scales around it.
+    // Calibrated by measuring the level as lit rather than by eye: sunlit
+    // plaster reads 1.32 scene-linear in the establish pose, and
+    // 1.32 * 1.125 * (auto 0.679) = 1.01, which the retuned curve puts at
+    // 0.82 sRGB with 46 display levels still above it.
+    this.exposure = 1.125;
     this.autoExposure = true;
 
     this._frame = 0;
@@ -647,6 +788,7 @@ export class RenderPipeline {
     this._mJitProj = new THREE.Matrix4();
     this._mInvViewProj = new THREE.Matrix4();
     this._prevCamPos = new THREE.Vector3(1e9, 1e9, 1e9);
+    this._prevFov = 0;
 
     this._targets = {};
     this._bloomMips = [];
@@ -696,17 +838,22 @@ export class RenderPipeline {
       uProjInv: { value: new THREE.Matrix4() },
       uTexel: { value: new THREE.Vector2() },
       uKernel: { value: kernel },
-      uRadius: { value: 0.65 },
+      uRadius: { value: 0.8 },
+      uRadius2: { value: 0.15 },
       uBias: { value: 0.022 },
-      uIntensity: { value: 1.0 },
+      // The contact bias has to scale with the contact radius or the tight
+      // kernel self-occludes on any surface that is not exactly flat.
+      uBias2: { value: 0.005 },
+      uIntensity: { value: 1.15 },
+      uIntensity2: { value: 1.15 },
       uFrame: { value: 0 },
-    }, { SAMPLES: 10 });
+    }, { SAMPLES: 10, SAMPLES2: 8 });
 
     this.mat.aoBlur = mk(AO_BLUR_FRAG, {
       tAO: { value: null },
       tDepth: { value: null },
       uTexel: { value: new THREE.Vector2() },
-      uDepthSigma: { value: 900.0 },
+      uDepthSigma: { value: 16000.0 },
     });
 
     this.mat.taa = mk(TAA_FRAG, {
@@ -715,6 +862,7 @@ export class RenderPipeline {
       tDepth: { value: null },
       tAO: { value: null },
       uInvViewProj: { value: new THREE.Matrix4() },
+      uCurViewProj: { value: new THREE.Matrix4() },
       uPrevViewProj: { value: new THREE.Matrix4() },
       uProjInv: { value: new THREE.Matrix4() },
       uTexel: { value: new THREE.Vector2() },
@@ -733,18 +881,29 @@ export class RenderPipeline {
       tLum: { value: null },
       tPrev: { value: null },
       uRate: { value: 1.0 },
+      // Measured on this level the two channels separate the poses by about
+      // the same amount, so this is set for highlight protection rather than
+      // for pose separation: enough that turning into the sun stops the
+      // exposure down, not so much that one bright object owns the frame.
+      uHiBias: { value: 0.35 },
+      uDeadband: { value: 0.12 },
     });
 
     this.mat.prefilter = mk(PREFILTER_FRAG, {
       tColor: { value: null },
       tAdapt: { value: null },
       uTexel: { value: new THREE.Vector2() },
-      uThreshold: { value: 1.05 },
+      // Threshold sits ~0.4 stop above a sunlit diffuse white at the working
+      // exposure, so bloom is a veil on genuinely bright pixels and never a
+      // haze over every lit wall.
+      uThreshold: { value: 1.4 },
       uKnee: { value: 0.55 },
       uExposure: { value: 1.0 },
-      uAutoKey: { value: 0.17 },
-      uAutoMin: { value: 0.5 },
-      uAutoMax: { value: 2.2 },
+      uAutoKey: { value: AUTO.key },
+      uAutoMin: { value: AUTO.min },
+      uAutoMax: { value: AUTO.max },
+      uAdaptRef: { value: AUTO.ref },
+      uAdaptStrength: { value: AUTO.strength },
     }, { USE_AUTOEXP: '' });
 
     this.mat.down = mk(DOWN_FRAG, {
@@ -765,21 +924,31 @@ export class RenderPipeline {
       tAdapt: { value: null },
       uTexel: { value: new THREE.Vector2() },
       uExposure: { value: 1.0 },
-      uAutoKey: { value: 0.17 },
-      uAutoMin: { value: 0.5 },
-      uAutoMax: { value: 2.2 },
+      uAutoKey: { value: AUTO.key },
+      uAutoMin: { value: AUTO.min },
+      uAutoMax: { value: AUTO.max },
+      uAdaptRef: { value: AUTO.ref },
+      uAdaptStrength: { value: AUTO.strength },
       uBloom: { value: 0.062 },
       uAoStrength: { value: 0.85 },
       uVignette: { value: 0.34 },
-      uCA: { value: 0.0022 },
+      // A third of what it was. At 0.0022 the corner fringe was 3px wide at
+      // 1080p, which reads as print misregistration on every crack edge rather
+      // than as glass.
+      uCA: { value: 0.00075 },
       uGrain: { value: 0.022 },
-      uSharpen: { value: 0.38 },
+      // Lower, and with a tighter clamp: on a converged TAA edge the unsharp
+      // delta is large, and at 0.38/±0.35 the mask was rebuilding the hard step
+      // TAA had just resolved — sharpening the aliasing back in.
+      uSharpen: { value: 0.28 },
       uFrame: { value: 0 },
-      uLift: { value: new THREE.Vector3(0.006, 0.0085, 0.0135) },
-      uGain: { value: new THREE.Vector3(1.005, 1.0, 0.992) },
-      uGammaGrade: { value: 0.985 },
+      // DISPLAY-referred now. Same intent (cool the floor, warm the top) but
+      // ~1/3 the previous perceptual weight instead of ~10x it.
+      uLift: { value: new THREE.Vector3(0.004, 0.006, 0.013) },
+      uGain: { value: new THREE.Vector3(1.0, 0.999, 0.994) },
+      uGammaGrade: { value: 1.0 },
       uSaturation: { value: 0.9 },
-      uContrast: { value: 0.16 },
+      uContrast: { value: 0.18 },
     }, { USE_BLOOM: '', USE_SHARPEN: '' });
   }
 
@@ -801,7 +970,12 @@ export class RenderPipeline {
     this.mat.taa.defines = t.ao ? { USE_AO: '' } : {};
     this.mat.taa.needsUpdate = true;
 
-    this.mat.ao.defines = { SAMPLES: Math.max(4, t.aoSamples) };
+    // The contact term needs fewer taps than the wide one: its kernel covers a
+    // few texels, so the variance it has to average down is much lower.
+    this.mat.ao.defines = {
+      SAMPLES: Math.max(4, t.aoSamples),
+      SAMPLES2: Math.max(4, Math.round(t.aoSamples * 0.75)),
+    };
     this.mat.ao.needsUpdate = true;
 
     this.mat.prefilter.defines = (t.autoExp && this.autoExposure) ? { USE_AUTOEXP: '' } : {};
@@ -942,6 +1116,9 @@ export class RenderPipeline {
     // A teleport (bench shot setup, respawn) invalidates every motion vector.
     if (this._prevCamPos.distanceToSquared(camera.position) > 4) reset = 1;
     this._prevCamPos.copy(camera.position);
+    // ADS is a smooth ramp, so a large single-frame delta here is a cut, not a
+    // transition. Read rather than written — the camera is not ours.
+    const fov = camera.isPerspectiveCamera ? camera.fov : this._prevFov;
 
     // --- jittered scene render into HDR ------------------------------------
     const useTaa = t.taa;
@@ -999,6 +1176,7 @@ export class RenderPipeline {
       u.tDepth.value = T.scene.depthTexture;
       u.tAO.value = aoTex;
       u.uInvViewProj.value.copy(this._mInvViewProj);
+      u.uCurViewProj.value.copy(this._mViewProj);
       u.uPrevViewProj.value.copy(reset ? this._mViewProj : this._mPrevViewProj);
       u.uProjInv.value.copy(this._mJitProj).invert();
       u.uTexel.value.set(1 / W, 1 / H);
@@ -1023,9 +1201,14 @@ export class RenderPipeline {
       const au = this.mat.adapt.uniforms;
       au.tLum.value = T.lum.texture;
       au.tPrev.value = ar.texture;
-      // Snap on the first frame after a resize/quality change so a static camera
-      // is fully converged immediately — screenshots must not depend on dt.
-      au.uRate.value = this._adaptPrimed ? 1 - Math.exp(-Math.min(0.1, dt) * 2.6) : 1.0;
+      // Snap on a cut. A resize, a quality change, a teleport/respawn or a
+      // one-frame FOV jump all mean the previous reading describes a different
+      // scene, and carrying it over would make the exposure — and therefore
+      // every screenshot — depend on which pose was captured before this one.
+      // Everywhere else the eye takes ADAPT_TAU to move, which is slow enough
+      // to read as adaptation and not as an auto-brightness control.
+      const cut = !this._adaptPrimed || reset || Math.abs(fov - this._prevFov) > 6;
+      au.uRate.value = cut ? 1.0 : 1 - Math.exp(-Math.min(0.1, dt) / ADAPT_TAU);
       this._pass(this.mat.adapt, aw);
       this._adaptIndex = 1 - this._adaptIndex;
       this._adaptPrimed = true;
@@ -1071,6 +1254,7 @@ export class RenderPipeline {
 
     // --- bookkeeping -------------------------------------------------------
     this._mPrevViewProj.copy(this._mViewProj);
+    this._prevFov = fov;
     this._frame++;
     this._passCost = this._computePassCost(mips);
     if (this._frame - this._shadowScanAt > 60) this._scanShadows(scene);

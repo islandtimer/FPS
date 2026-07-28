@@ -28,6 +28,32 @@
 // Output is read back to DataTextures rather than kept as render-target textures:
 // that makes them cheap to clone for different repeat values (clones share the
 // GPU upload via Texture.source), and it makes the VRAM accounting exact.
+//
+// TEXEL DENSITY — read this before changing any frequency
+// ------------------------------------------------------
+// A frequency in here is meaningless without knowing how much WORLD the tile
+// covers. level.js owns that (its UVS table, repeat 1 everywhere), so those
+// numbers are mirrored below and every generator quotes its features in
+// millimetres, not in cycles.
+//
+//   family    uv/m    tile span   texel @512   texel @1024
+//   plaster   0.50    2.000 m     3.91 mm      1.95 mm
+//   concrete  0.50    2.000 m     3.91 mm      —
+//   road      0.40    2.500 m     4.88 mm      —      (same bake as concrete)
+//   brick     0.62    1.613 m     3.15 mm      —
+//   ground    0.34    2.941 m     5.75 mm      —
+//   wood      0.85    1.176 m     2.30 mm      —
+//   metal     0.90    1.111 m     2.17 mm      —
+//   fabric    1.10    0.909 m     1.78 mm      —
+//
+// Nothing narrower than about 1.5 texels survives the mip chain, so features
+// are sized against the table above rather than picked by eye.
+//
+// HEIGHT UNITS. The compose pass turns the height field into a normal with
+// slope = dh_over_two_texels * uBump, which means one unit of height equals
+// (2 * texelSize * bump) of world. For plaster that is 2 * 3.91mm * 11 = 86 mm,
+// so a 1 mm hairline crack is a height step of 0.012 — not 0.30. Getting this
+// wrong is exactly how a hairline crack ends up reading as a metre-wide canyon.
 
 import * as THREE from 'three';
 import { hash32 } from '../core/rng.js';
@@ -51,8 +77,12 @@ const MAT_ID = {
 //         perceived relief does not change when the size changes.
 //   ao    occlusion gain,  cav  cavity-grime gain,  det  fine-detail gain
 const BAKE = {
-  concrete:     { size: 512, bump: 13.0, ao: 3.4, cav: 26.0, det: 26.0 },
-  plaster:      { size: 512, bump: 11.0, ao: 3.0, cav: 30.0, det: 34.0 },
+  concrete:     { size: 512, bump: 13.0, ao: 3.4, cav: 26.0, det: 30.0 },
+  // plaster is the hero surface — it is most of every wall in the level, and at
+  // 512 over a 2 m tile a 6 mm hairline crack is 1.5 texels, which aliases into
+  // a fat grey line before it ever reaches the mip chain. 1024 buys 1.95 mm
+  // texels, which is what makes the craquelure read as craquelure.
+  plaster:      { size: 1024, bump: 11.0, ao: 2.1, cav: 24.0, det: 40.0 },
   sand:         { size: 512, bump:  9.5, ao: 2.1, cav: 18.0, det: 46.0 },
   asphalt:      { size: 512, bump: 15.0, ao: 3.8, cav: 24.0, det: 24.0 },
   rustMetal:    { size: 512, bump: 14.0, ao: 3.6, cav: 22.0, det: 22.0 },
@@ -64,7 +94,7 @@ const BAKE = {
   rubber:       { size: 512, bump: 11.0, ao: 2.6, cav: 30.0, det: 46.0 },
   glass:        { size: 512, bump:  6.0, ao: 1.4, cav: 40.0, det: 60.0 },
   tile:         { size: 512, bump: 13.0, ao: 3.4, cav: 24.0, det: 40.0 },
-  brick:        { size: 512, bump: 13.0, ao: 3.6, cav: 22.0, det: 28.0 },
+  brick:        { size: 512, bump: 13.0, ao: 2.4, cav: 16.0, det: 30.0 },
 };
 
 // ---------------------------------------------------------------- GLSL library
@@ -183,46 +213,111 @@ void main() {
   vec4 F = vec4(0.5, 0.0, 0.0, 0.5);
 
 #if MAT == 0
-  // ---- concrete: cast aggregate, spalled patches, water runs, air pockets
+  // ---- cast concrete. TILE 2.00 m; one height unit is ~102 mm, so every depth
+  // below is written as millimetres/102.
   vec2 wq = dwarp(uv, vec2(3.0), 0.06, S + 11u);
-  float macro  = fbm01(wq, vec2(3.0), 4, 0.55, S + 2u);
+  float macro  = smoothstep(0.33, 0.67, fbm01(wq, vec2(3.0), 4, 0.55, S + 2u));
   float cement = fbm(wq, vec2(23.0), 3, 0.5, S + 3u);
   float micro  = fbm(uv, vec2(97.0), 2, 0.5, S + 4u);
   vec3  agg    = worley(dwarp(uv, vec2(11.0), 0.02, S + 9u), vec2(58.0), 0.95, S + 7u);
   float stone  = 1.0 - smoothstep(0.02, 0.36, agg.x);
+
+  // Formwork. 29 cm boards leave a shallow groove and a small step at every
+  // joint, and no two boards sit at quite the same depth. On a big flat face
+  // this is the single strongest "poured" cue there is.
+  float bv    = uv.y * 7.0;
+  float bJ    = abs(fract(bv) - 0.5);
+  float seamF = 1.0 - smoothstep(0.012, 0.045, bJ);
+  float bStep = (hf(vec2(0.5, floor(bv)), vec2(1.0, 7.0), S + 61u) - 0.5) * 0.013;
+
   float spallF = fbm01(dwarp(uv, vec2(5.0), 0.10, S + 21u), vec2(4.0), 4, 0.55, S + 5u);
-  float spall  = smoothstep(0.58, 0.69, spallF);
+  float spall  = smoothstep(0.595, 0.655, spallF);
   vec3  ph     = worley(uv, vec2(86.0), 1.0, S + 31u);
   float holes  = smoothstep(0.16, 0.02, ph.x) * step(0.87, ph.z);
-  // Water staining: noise stretched ~10:1 vertically reads as runs without the
+  // Water staining. The noise is stretched ~9:1 vertically, then gated by a
+  // periodic ramp that is zero at both ends of the tile: the run therefore has
+  // a definite top (a sill) and dies out about a metre below it, without the
   // seam a real top-to-bottom gradient would leave at the tile edge.
   float streak = fbm01(uv, vec2(37.0, 4.0), 3, 0.6, S + 13u);
-  float src    = smoothstep(0.50, 0.78, fbm01(uv, vec2(7.0, 3.0), 3, 0.5, S + 17u));
-  float run    = smoothstep(0.34, 0.78, streak) * src;
+  float rPh    = fbm01(uv, vec2(3.0, 2.0), 2, 0.5, S + 27u);
+  float rQ     = fract(uv.y + rPh * 0.8);
+  float rEnv   = (1.0 - smoothstep(0.58, 0.66, rQ)) * smoothstep(0.02, 0.26, rQ)
+               * (0.40 + 0.60 * smoothstep(0.04, 0.52, rQ));
+  float src    = smoothstep(0.42, 0.74, fbm01(uv, vec2(7.0, 3.0), 3, 0.5, S + 17u));
+  float run    = smoothstep(0.34, 0.78, streak) * src * rEnv;
   float grime  = fbm01(wq, vec2(9.0), 4, 0.5, S + 19u);
-  float h = 0.5 + cement * 0.045 + micro * 0.012
-          - spall * 0.085 + spall * stone * 0.055
-          - holes * 0.16 + (macro - 0.5) * 0.03;
-  F = vec4(h, spall * (0.35 + stone * 0.65), clamp(run * 0.85 + grime * 0.22, 0.0, 1.0), macro);
+  float h = 0.5 + cement * 0.030 + micro * 0.008 + bStep
+          - seamF * 0.015
+          - spall * 0.055 + spall * stone * 0.040
+          - holes * 0.045 + (macro - 0.5) * 0.024;
+  F = vec4(h, spall * (0.35 + stone * 0.65),
+           clamp(run * 0.90 + grime * 0.20 + seamF * 0.28, 0.0, 1.0), macro);
 
 #elif MAT == 1
-  // ---- plaster / painted wall: trowel roll, stipple, hairline cracks, chipping
+  // ---- lime/cement render on masonry. TILE 2.00 m at 1024 px => 1.95 mm/texel,
+  // one height unit ~86 mm. Everything below is quoted in millimetres.
   vec2 wq = dwarp(uv, vec2(3.0), 0.05, S + 3u);
-  float macro   = fbm01(wq, vec2(2.0), 3, 0.5, S + 2u);
-  float stipple = fbm(uv, vec2(110.0), 2, 0.5, S + 5u);
-  float roll    = fbm(uv, vec2(17.0), 3, 0.5, S + 6u);
-  vec3  c1 = worley(dwarp(uv, vec2(7.0),  0.05, S + 11u), vec2(9.0),  1.0, S + 12u);
-  vec3  c2 = worley(dwarp(uv, vec2(13.0), 0.04, S + 13u), vec2(23.0), 1.0, S + 14u);
-  float crack = smoothstep(0.045, 0.0, c1.y - c1.x) * 0.9
-              + smoothstep(0.030, 0.0, c2.y - c2.x) * 0.5;
-  crack *= smoothstep(0.35, 0.62, fbm01(uv, vec2(5.0), 3, 0.5, S + 15u));
+
+  // (a) MACRO TONE. 25 cm - 1 m patchiness: skim coats, old repairs, sun
+  //     bleaching. materials.js lays a second ~6.7 m field over the top of this,
+  //     so together they cover the whole 0.25-7 m band. Without both, a 6 m wall
+  //     is one flat beige at 40 m no matter how good the 5 cm detail is.
+  // contrast-stretched: raw fbm clusters hard around 0.5, so feeding it
+  // straight into a colour ramp uses about a third of the range asked for and
+  // the wall comes back flat however wide the ramp is
+  float macro = smoothstep(0.34, 0.66, fbm01(wq, vec2(2.0), 4, 0.60, S + 2u));
+
+  // (b) TROWEL WORK. 12 cm float sweeps at ~2 mm, 1 mm stipple on top.
+  float roll    = fbm(dwarp(uv, vec2(7.0), 0.03, S + 41u), vec2(17.0), 3, 0.55, S + 6u);
+  float stipple = fbm(uv, vec2(150.0), 2, 0.5, S + 5u);
+
+  // (c) CRAQUELURE. 26 cells across a 2 m tile is 7.7 cm map cracking; the
+  //     second net at 47 cells is 4.3 cm hairlines. Thresholds are in CELL
+  //     units, so 0.085 of a 7.7 cm cell is a 6.5 mm line — three texels at
+  //     1024, which is the narrowest thing that survives mipping.
+  vec3 c1 = worley(dwarp(uv, vec2(11.0), 0.016, S + 11u), vec2(26.0), 1.0, S + 12u);
+  vec3 c2 = worley(dwarp(uv, vec2(23.0), 0.008, S + 13u), vec2(47.0), 1.0, S + 14u);
+  float crack = smoothstep(0.085, 0.006, c1.y - c1.x)
+              + smoothstep(0.110, 0.010, c2.y - c2.x) * 0.42;
+  crack *= smoothstep(0.30, 0.68, fbm01(uv, vec2(3.0), 3, 0.5, S + 15u));
   crack = clamp(crack, 0.0, 1.0);
-  // Paint comes off in patches, not speckles: few octaves, hard threshold, and
-  // it starts at the cracks.
-  float chipF = fbm01(dwarp(uv, vec2(5.0), 0.10, S + 21u), vec2(4.0), 3, 0.5, S + 22u);
-  float chip  = smoothstep(0.615, 0.665, chipF + crack * 0.14);
-  float h = 0.5 + roll * 0.03 + stipple * 0.012 - crack * 0.30 - chip * 0.030;
-  F = vec4(h, chip, crack, macro);
+
+  // (d) SPALL. The finish coat lets go in patches and the coarse base render
+  //     shows through. The edge is hard because it breaks rather than fades,
+  //     the loss is ~3 mm, and the intact coat stands proud around the hole so
+  //     one side of every patch catches the key and the other side occludes.
+  float spallF = fbm01(dwarp(uv, vec2(7.0), 0.07, S + 21u), vec2(9.0), 3, 0.50, S + 22u)
+               + crack * 0.050;
+  float spall  = smoothstep(0.606, 0.622, spallF);
+  float lip    = smoothstep(0.576, 0.604, spallF) * (1.0 - smoothstep(0.604, 0.618, spallF));
+  // the substrate has its own, much coarser grain — 2 cm aggregate, carried in
+  // the height so the normal map and the albedo speckle agree about where it is.
+  // Kept shallow: a deep grit field drives the baked AO to its floor across the
+  // whole patch, which turns the exposed render into a dark blot instead of the
+  // lighter, coarser thing it is.
+  vec3  sg   = worley(dwarp(uv, vec2(23.0), 0.01, S + 33u), vec2(98.0), 1.0, S + 31u);
+  float grit = smoothstep(0.30, 0.06, sg.x);
+
+  // (e) RUNOFF. Same periodic-ramp trick as concrete: a hard top edge where a
+  //     sill would be, then ~1.2 m of tail that fades out inside the tile.
+  float rPh  = fbm01(uv, vec2(3.0, 2.0), 2, 0.5, S + 27u);
+  float rQ   = fract(uv.y + rPh * 0.8);
+  float rEnv = (1.0 - smoothstep(0.60, 0.67, rQ)) * smoothstep(0.02, 0.28, rQ)
+             * (0.35 + 0.65 * smoothstep(0.05, 0.55, rQ));
+  float rCol = smoothstep(0.38, 0.78, fbm01(uv, vec2(6.0, 2.0), 3, 0.5, S + 25u));
+  float run  = smoothstep(0.44, 0.86, fbm01(uv, vec2(52.0, 5.0), 3, 0.6, S + 23u)) * rEnv * rCol;
+
+  float dirt = smoothstep(0.50, 0.80, fbm01(wq, vec2(9.0), 4, 0.55, S + 19u));
+
+  float h = 0.5
+          + roll * 0.024              // 2.1 mm trowel undulation
+          + stipple * 0.010           // 0.9 mm stipple
+          - crack * 0.016             // 1.4 mm hairline, not a 26 mm trench
+          - spall * 0.038             // 3.3 mm of finish coat gone
+          + lip * 0.019               // the broken edge stands proud
+          + spall * grit * 0.0065     // exposed aggregate inside the patch
+          + (macro - 0.5) * 0.010;
+  F = vec4(h, spall, clamp(crack * 0.80 + run * 1.00 + dirt * 0.45, 0.0, 1.0), macro);
 
 #elif MAT == 2
   // ---- sand / dry earth: dune scale, wind ripples, pebble scatter, grain
@@ -324,20 +419,66 @@ void main() {
   F = vec4(h, seam, peb, macro);
 
 #elif MAT == 8
-  // ---- wood: growth rings, fibre grain, splits along the grain, weathering
-  vec2  wq = dwarp(uv, vec2(2.0, 5.0), 0.05, S + 3u);
-  float ringPhase = wq.y * 9.0 + fbm(uv, vec2(2.0, 6.0), 3, 0.5, S + 4u) * 1.2;
-  float ring = fract(ringPhase);
-  float late = smoothstep(0.60, 0.80, ring) * (1.0 - smoothstep(0.86, 0.98, ring));
-  float grain = fbm(uv, vec2(8.0, 110.0), 2, 0.55, S + 5u);
-  float fibre = fbm(uv, vec2(4.0, 160.0), 1, 0.5, S + 6u);
-  float sp = rfbm(uv, vec2(3.0, 90.0), 2, S + 7u);
+  // ---- sawn timber. TILE 1.176 m (level.js UVS.wood 0.85); one height unit is
+  // ~55 mm; one texel is 2.3 mm.
+  //
+  // Rebuilt as DISCRETE BOARDS. Five 23.5 cm boards with a gap between them and
+  // growth rings at 8-10 mm — 4 texels, the finest ring pitch that survives the
+  // mip chain. The old single 13 cm swirl across the whole tile read as marbled
+  // paper; a staggered grid of short boards reads as brickwork. Boards here run
+  // the full width of the tile with ONE butt joint each, at a random position,
+  // which is the only arrangement that reads as timber and not as masonry.
+  const float NB = 5.0;
+  float bv  = uv.y * NB;
+  float bi  = floor(bv);
+  float bf  = fract(bv);
+  float bid = hf(vec2(0.0, bi), vec2(1.0, NB), S + 3u);
+
+  // every board is cut from a different part of a different log: its own ring
+  // pitch, its own distance from the pith, its own tone
+  float pitch  = 118.0 + bid * 26.0;                       // 8.2 - 10.0 mm rings
+  float centre = hf(vec2(1.0, bi), vec2(1.0, NB), S + 4u) * 2.4 - 0.7;
+  float across = (bf - centre) / NB;
+  vec2  wq = dwarp(uv, vec2(3.0, 9.0), 0.008, S + 5u);
+  float faceP = abs(across) * pitch + fbm(wq, vec2(3.0, 11.0), 3, 0.5, S + 6u) * 1.6;
+
+  // one butt joint per board, at a position that has nothing to do with its
+  // neighbours', plus a narrow band of cross-cut grain beside it so a board END
+  // reads as an end and not as more face
+  float lf   = fract(uv.x + hf(vec2(2.0, bi), vec2(1.0, NB), S + 13u));
+  float lE   = min(lf, 1.0 - lf);
+  // gap width varies per board, and about a third of them close up entirely —
+  // five boards each with an identical visible butt joint reads as brickwork
+  float bw   = max(0.0, hf(vec2(3.0, bi), vec2(1.0, NB), S + 17u) - 0.30) * 0.014;
+  float butt = 1.0 - smoothstep(bw * 0.35, bw + 0.0015, lE);
+  float endP = length(vec2(lE * 2.2, across * 1.1)) * pitch * 1.05;
+  float endM = smoothstep(0.038, 0.013, lE);
+  float ring = mix(sin(TAU * faceP), sin(TAU * endP), endM) * 0.5 + 0.5;
+  float late = pow(ring, 1.7);                             // band-limited: no comb alias
+
+  // gap between boards
+  float seamY = 1.0 - smoothstep(0.005, 0.020, min(bf, 1.0 - bf));
+
+  float grain = fbm(uv, vec2(7.0, 90.0), 2, 0.55, S + 7u);  // fibre along the board
+  float saw   = fbm(uv, vec2(130.0, 6.0), 1, 0.5, S + 8u);  // saw marks across it
+  float sp = rfbm(uv, vec2(3.0, 70.0), 2, S + 9u);
   float split = smoothstep(0.93, 0.997, sp)
-              * smoothstep(0.35, 0.72, fbm01(uv, vec2(4.0), 3, 0.5, S + 8u));
-  float weather = smoothstep(0.40, 0.76, fbm01(dwarp(uv, vec2(3.0), 0.07, S + 9u), vec2(3.0), 4, 0.5, S + 10u));
-  float h = 0.5 - late * 0.020 + grain * 0.012 + fibre * 0.005
-          - split * 0.34 - weather * 0.008;
-  F = vec4(h, late, split, weather);
+              * smoothstep(0.35, 0.72, fbm01(uv, vec2(4.0), 3, 0.5, S + 10u));
+  // Weathering greys along the grain, board by board — not in clouds. Cloudy
+  // weathering over the top of board seams reads as spilt paint.
+  float weather = clamp(bid * 0.55
+                + fbm01(uv, vec2(4.0, 26.0), 3, 0.55, S + 11u) * 0.55
+                + (across * across) * 1.2 - 0.20, 0.0, 1.0);
+
+  float h = 0.5
+          + late * 0.010 * (0.35 + weather)  // earlywood erodes, latewood stands proud
+          + grain * 0.007
+          + saw * 0.003
+          - split * 0.026                    // 1.4 mm check along the grain
+          - butt * 0.034
+          - seamY * 0.058
+          - (bf - 0.5) * (bf - 0.5) * 0.026; // each board cups slightly
+  F = vec4(h, late, clamp(split * 0.85 + seamY * 0.9 + butt * 0.9, 0.0, 1.0), weather);
 
 #elif MAT == 9
   // ---- fabric: plain weave over/under, slub, sun fade, dirt at contact points
@@ -393,21 +534,43 @@ void main() {
   F = vec4(h, grout, id, chip);
 
 #else
-  // ---- brick: running bond, recessed mortar, per-brick tone, face erosion
-  const float ROWS = 8.0, COLS = 4.0;
+  // ---- brick, running bond. TILE 1.613 m (level.js UVS.brick 0.62), so 7 x 21
+  // cells is a 230 x 77 mm module: a 215 x 65 mm brick with a 10 mm bed joint.
+  // One height unit is ~82 mm, one texel 3.15 mm.
+  const float ROWS = 21.0, COLS = 7.0;
   float ry  = uv.y * ROWS;
   float row = floor(ry);
   float rx  = uv.x * COLS + mod(row, 2.0) * 0.5;
   float col = floor(rx);
   vec2 f = vec2(fract(rx), fract(ry));
   float id = hf(vec2(col, row), vec2(COLS, ROWS), S + 3u);
-  vec2 e = min(f, 1.0 - f);
-  float edge   = min(e.x, e.y);
-  float mortar = 1.0 - smoothstep(0.030, 0.070, edge);
-  float erode = fbm(uv, vec2(70.0), 2, 0.5, S + 4u);
-  float pit   = smoothstep(0.58, 0.88, fbm01(uv, vec2(110.0), 1, 0.5, S + 5u)) * (1.0 - mortar);
-  float h = 0.5 + (1.0 - mortar) * 0.050 + erode * 0.012 - pit * 0.045 - mortar * 0.018;
-  F = vec4(h, mortar, id, erode * 0.5 + 0.5);
+
+  // The joint width is measured in UV, not in cell fractions. The cell is 3:1,
+  // so the old cell-fraction test made the perp joints three times wider than
+  // the bed joints — which is most of why the mortar read as a painted grid.
+  vec2  e    = min(f, 1.0 - f) * vec2(1.0 / COLS, 1.0 / ROWS);
+  float edge = min(e.x, e.y);
+  float jw   = 0.0031 + (id - 0.5) * 0.0009;              // ~10 mm, struck by hand
+  float mortar = 1.0 - smoothstep(jw * 0.55, jw * 1.55, edge);
+  float arris  = 1.0 - smoothstep(jw * 1.5, jw * 3.6, edge);   // worn brick edge
+
+  float erode = fbm(uv, vec2(90.0), 2, 0.5, S + 4u);
+  float pit   = smoothstep(0.62, 0.90, fbm01(uv, vec2(150.0), 1, 0.5, S + 5u)) * (1.0 - mortar);
+  float mgrit = fbm(uv, vec2(110.0), 1, 0.5, S + 6u);           // sand in the mortar
+  float salt  = smoothstep(0.55, 0.88, fbm01(uv, vec2(5.0, 9.0), 3, 0.55, S + 7u));
+
+  // The joint is RAKED — it sits ~4 mm behind the brick face, it does not stand
+  // proud of it. Deeper than that and the baked AO turns every joint into a
+  // black line, which is the painted-grid look this is trying to get away from.
+  // Bricks are also laid a millimetre or two out of plane.
+  float h = 0.5
+          + erode * 0.006
+          - pit * 0.012
+          - mortar * 0.048
+          - arris * 0.008
+          + mortar * mgrit * 0.004
+          + (id - 0.5) * 0.009;
+  F = vec4(h, mortar, id, clamp(erode * 0.5 + 0.5 + salt * 0.30, 0.0, 1.0));
 #endif
 
   fragColor = F;
@@ -427,13 +590,26 @@ uniform float uBump;
 uniform float uAO;
 uniform float uCav;
 uniform float uDet;
+uniform float uSeed;
 uniform int   uOut;     // 0 albedo, 1 normal, 2 ORM
+${GLSL_LIB}
 
 float H(vec2 uv) { return texture(uFields, uv).r; }
 
 void main() {
+  uint S = uint(uSeed);
   vec4 f = texture(uFields, vUv);
   float h = f.r, m1 = f.g, m2 = f.b, ma = f.a;
+
+  // Spatial roughness break. One sheen over every substance in the world is the
+  // loudest material tell there is, so each family gets its own band AND its own
+  // variation inside that band. These two fields cost nothing in the albedo and
+  // normal bakes because only the ORM pass reads them.
+  float rqA = 0.5, rqB = 0.5;
+  if (uOut == 2) {
+    rqA = fbm01(vUv, vec2(3.0), 3, 0.55, S + 6101u);   // region scale
+    rqB = fbm01(vUv, vec2(11.0), 2, 0.50, S + 8221u);  // patch scale
+  }
 
   // --- tangent-space normal straight off the height field
   float hl = H(vUv - vec2(uTexel.x, 0.0));
@@ -444,15 +620,21 @@ void main() {
 
   // --- occlusion + a wide blur of the same field, for cavity grime and for the
   //     fine-detail term that drives albedo speckle. One field, three products.
-  float occ = 0.0, blur = 0.0;
-  for (int i = 0; i < 8; i++) {
-    float a = float(i) * 0.7853981634;
-    vec2 dir = vec2(cos(a), sin(a));
-    for (int k = 1; k <= 2; k++) {
-      float r = float(k) * 3.0;
-      float hs = H(vUv + dir * uTexel * r);
-      occ  += max(0.0, hs - h) / (1.0 + r * 0.12);
-      blur += hs;
+  float occ = 0.0, blur = h * 16.0;
+  // The normal pass needs only the four cross taps, so the 16-tap gather is
+  // skipped for it. That is a third of the whole compose cost, and at 1024 the
+  // compose pass is the most expensive thing this file does.
+  if (uOut != 1) {
+    occ = 0.0; blur = 0.0;
+    for (int i = 0; i < 8; i++) {
+      float a = float(i) * 0.7853981634;
+      vec2 dir = vec2(cos(a), sin(a));
+      for (int k = 1; k <= 2; k++) {
+        float r = float(k) * 3.0;
+        float hs = H(vUv + dir * uTexel * r);
+        occ  += max(0.0, hs - h) / (1.0 + r * 0.12);
+        blur += hs;
+      }
     }
   }
   blur *= 0.0625;
@@ -465,27 +647,54 @@ void main() {
   float metal = 0.0;
 
 #if MAT == 0
+  // formed faces are smooth (0.70-0.78); broken and spalled faces expose
+  // aggregate and are much rougher (0.86-0.92). That split is the whole point.
+  float formed = 1.0 - smoothstep(0.55, 0.86, rqA);
   alb = mix(vec3(0.415, 0.410, 0.390), vec3(0.545, 0.540, 0.516), ma);
   alb *= 1.0 + dn * 0.22;
   alb = mix(alb, vec3(0.655, 0.645, 0.610), m1 * 0.78);
   alb = mix(alb, vec3(0.225, 0.218, 0.202), m2 * 0.62);
   alb *= mix(1.0, 0.66, cav);
-  rough = 0.93 - m1 * 0.05 - m2 * 0.10 + dn * 0.06;
+  rough = 0.885 - formed * 0.165 + m1 * 0.045 + m2 * 0.02
+        + (rqB - 0.5) * 0.055 + abs(dn) * 0.05;
 
 #elif MAT == 1
-  vec3 paint = mix(vec3(0.715, 0.705, 0.675), vec3(0.815, 0.805, 0.770), ma);
-  alb = mix(paint, vec3(0.555, 0.512, 0.455), m1);
-  alb *= 1.0 + dn * 0.10;
-  alb = mix(alb, vec3(0.300, 0.290, 0.270), m2 * 0.70);
-  alb *= mix(1.0, 0.78, cav);
-  rough = mix(0.60, 0.90, m1) + m2 * 0.06 + dn * 0.03;
+  float sub = m1, grime = m2;
+  // Finish coat. Hue as well as value moves with the macro field — the low
+  // patches go cooler and greyer, the high ones warmer. Value alone reads as a
+  // dirty overlay; value plus hue reads as different material ages.
+  vec3 coat = mix(vec3(0.706, 0.672, 0.606), vec3(0.862, 0.842, 0.790), ma);
+  // hue rides with value but only a little, and biased warm: swing it hard and
+  // the darker patches go blue, which on a sunlit render reads as damp concrete
+  coat *= vec3(1.0 + (ma - 0.5) * 0.055, 1.0, 1.0 - (ma - 0.5) * 0.075);
+  // Exposed base render: clearly LIGHTER than the coat, greyer, and visibly
+  // coarse — dn is the same fine relief the normal map carries, so the grain you
+  // can see in the colour is the grain you can feel in the light.
+  vec3 base = vec3(0.856, 0.826, 0.766) * (1.0 + dn * 0.30);
+  alb = mix(coat, base, sub);
+  alb *= 1.0 + dn * 0.06;
+  // The stain in the MAP stays fairly light. Heavy darkening is left to the
+  // cavity and base-of-wall grime in materials.js, which multiplies AFTER the
+  // per-instance tint — bake it all in here and the level's warm tint clips the
+  // clean plaster to white before the dirt ever gets a say.
+  alb = mix(alb, vec3(0.462, 0.416, 0.352), grime * 0.58);
+  alb *= mix(1.0, 0.84, cav);
+  // 0.885 base, up to 0.955 on the raw substrate, down to ~0.60 where the float
+  // has burnished it. Range and variation, not one number.
+  rough = mix(0.885, 0.955, sub) + grime * 0.030 + (rqB - 0.5) * 0.045;
+  rough -= smoothstep(0.60, 0.88, rqA) * (1.0 - sub) * 0.30;
 
 #elif MAT == 2
-  alb = mix(vec3(0.585, 0.490, 0.335), vec3(0.725, 0.635, 0.455), ma);
-  alb *= 1.0 + dn * 0.30;
-  alb = mix(alb, vec3(0.500, 0.455, 0.385), m1 * 0.75);
-  alb *= mix(1.0, 0.86, cav);
-  rough = 0.96 - m1 * 0.10 - abs(dn) * 0.05;
+  // Albedo comes off the SAME height field as the normal: crests are dry, warm
+  // and bright, troughs hold damp, fine, grey material. Sand with a normal map
+  // and a flat albedo is the classic giveaway.
+  float hn = clamp((h - 0.5) * 6.0 + dn * 0.35, -1.0, 1.0) * 0.5 + 0.5;
+  alb = mix(vec3(0.500, 0.416, 0.288), vec3(0.745, 0.664, 0.500), hn);
+  alb *= vec3(1.0 + (hn - 0.5) * 0.10, 1.0, 1.0 - (hn - 0.5) * 0.14);
+  alb *= 1.0 + dn * 0.20;
+  alb = mix(alb, vec3(0.520, 0.472, 0.398), m1 * 0.75);
+  alb *= mix(1.0, 0.84, cav);
+  rough = 0.945 - m1 * 0.040 + (rqB - 0.5) * 0.045 - abs(dn) * 0.02;
 
 #elif MAT == 3
   // flat local relief == worn smooth by traffic
@@ -528,7 +737,11 @@ void main() {
   alb *= mix(1.0, 0.85, cav);
   // the machining lay lives in the macro channel; modulating roughness along it
   // is a cheap stand-in for true anisotropy
-  rough = mix(0.44, 0.16, wear) + phos * 0.10 + (ma - 0.5) * 0.10 + dn * 0.04;
+  // Phosphated steel sits at 0.42-0.45; the machined flats read 0.30-0.34; the
+  // handled edges polish down to 0.25. Never a mirror — 0.16 was reading as
+  // chrome, which is the wrong century for a service rifle.
+  rough = 0.445 - wear * 0.150 + phos * 0.020 + (ma - 0.5) * 0.055
+        - smoothstep(0.52, 0.90, rqA) * 0.090;
   metal = mix(0.88, 1.0, wear);
 
 #elif MAT == 7
@@ -536,16 +749,25 @@ void main() {
   alb *= 1.0 + dn * 0.10;
   alb = mix(alb, vec3(0.160, 0.158, 0.152), m1 * 0.50);
   alb *= mix(1.0, 0.88, cav);
-  rough = 0.58 + m2 * 0.14 - m1 * 0.12 + dn * 0.05;
+  // moulded polymer: 0.55 on the tool-polished faces, 0.72 on the stippled ones
+  rough = 0.615 + m2 * 0.085 - m1 * 0.060 + (rqB - 0.5) * 0.060
+        - smoothstep(0.58, 0.90, rqA) * 0.055 + dn * 0.04;
 
 #elif MAT == 8
-  float late = m1, split = m2, weather = ma;
-  alb = mix(vec3(0.420, 0.300, 0.175), vec3(0.245, 0.155, 0.085), late);
-  alb *= 1.0 + dn * 0.22;
-  alb = mix(alb, vec3(0.440, 0.420, 0.385), weather * 0.60);
-  alb = mix(alb, vec3(0.100, 0.075, 0.050), split * 0.80);
-  alb *= mix(1.0, 0.72, cav);
-  rough = 0.72 + weather * 0.20 + late * 0.05 + dn * 0.05;
+  float late = m1, seam = m2, tone = ma;
+  // one axis from fresh heartwood to pale grey weathered sapwood, with the
+  // latewood ring as a darker, denser line on top of whatever that lands on
+  vec3 fresh = vec3(0.452, 0.302, 0.170);
+  vec3 grey  = vec3(0.466, 0.428, 0.382);
+  alb = mix(fresh, grey, smoothstep(0.34, 0.95, tone));
+  alb = mix(alb, alb * vec3(0.58, 0.54, 0.50), late * 0.80);
+  alb *= 1.0 + dn * 0.20;
+  alb = mix(alb, vec3(0.105, 0.080, 0.058), seam * 0.85);
+  alb *= mix(1.0, 0.78, cav);
+  // Sawn timber, no varnish anywhere: 0.62 on a planed, handled face at the
+  // very smoothest, 0.83 on saw-torn and weathered grain.
+  rough = 0.785 - smoothstep(0.52, 0.90, rqA) * 0.165 + late * 0.020
+        + seam * 0.030 + (tone - 0.5) * 0.050;
 
 #elif MAT == 9
   float over = m1, dirt = m2, fade = ma;
@@ -578,18 +800,33 @@ void main() {
   rough = mix(0.22, 0.88, grout) + chip * 0.40;
 
 #else
-  float mortar = m1, id = m2, ero = ma;
-  vec3 brick = mix(vec3(0.300, 0.145, 0.105), vec3(0.440, 0.235, 0.165), id);
-  brick = mix(brick, vec3(0.360, 0.300, 0.255), ero * 0.25);
-  alb = mix(brick, vec3(0.545, 0.535, 0.505), mortar);
-  alb *= 1.0 + dn * 0.20;
-  alb *= mix(1.0, 0.70, cav);
-  rough = mix(0.88, 0.95, mortar) + dn * 0.05;
+  float mortar = m1, id = m2, tone = ma;
+  // No two bricks out of the same kiln match. The id hash drives value, and a
+  // sixth of them are overburnt headers that came out much darker and greyer.
+  vec3 clay = mix(vec3(0.372, 0.222, 0.168), vec3(0.572, 0.382, 0.286), id);
+  clay = mix(clay, vec3(0.300, 0.216, 0.190), smoothstep(0.86, 0.94, id) * 0.75);
+  clay = mix(clay, vec3(0.470, 0.404, 0.344), smoothstep(0.45, 0.98, tone) * 0.45);
+  clay *= 1.0 + dn * 0.22;
+  // Mortar: DESATURATED WARM grey, DARKER than the brick it beds, and matte.
+  // It has to be baked warm because the level tints this map toward a dusty
+  // buff, and a tint that desaturates clay pushes anything neutral blue.
+  vec3 joint = vec3(0.400, 0.362, 0.312) * (1.0 + dn * 0.30);
+  alb = mix(clay, joint, mortar);
+  // dirt collects in the rake of the joint, so the deep part is darker again
+  alb *= mix(1.0, 0.80, cav);
+  rough = mix(0.845, 0.968, mortar) + (rqB - 0.5) * 0.035 + abs(dn) * 0.03;
 #endif
 
   if (uOut == 0)      fragColor = vec4(clamp(alb, 0.0, 1.0), 1.0);
   else if (uOut == 1) fragColor = vec4(nrm * 0.5 + 0.5, 1.0);
-  else                fragColor = vec4(ao, clamp(rough, 0.03, 1.0), clamp(metal, 0.0, 1.0), 1.0);
+  else fragColor = vec4(ao, clamp(rough, 0.03, 1.0), clamp(metal, 0.0, 1.0),
+                        // ALPHA = curvature. 0.5 flat, >0.5 convex (a ridge that
+                        // should wear bright), <0.5 concave (a crevice that
+                        // should collect grime). materials.js reads it back out
+                        // of the same fetch it already makes for roughness, so
+                        // every consumer gets cavity grime and edge wear for the
+                        // cost of nothing.
+                        clamp(0.5 + (h - blur) * uDet * 0.45, 0.0, 1.0));
 }
 `;
 
@@ -678,7 +915,7 @@ function fieldsMaterial(id, seed) {
   return m;
 }
 
-function composeMaterial(id, cfg) {
+function composeMaterial(id, cfg, seed) {
   let m = _composeMat.get(id);
   if (!m) {
     m = new THREE.ShaderMaterial({
@@ -690,6 +927,7 @@ function composeMaterial(id, cfg) {
         uAO: { value: 3 },
         uCav: { value: 24 },
         uDet: { value: 30 },
+        uSeed: { value: 0 },
         uOut: { value: 0 },
       },
       vertexShader: VERT,
@@ -703,6 +941,7 @@ function composeMaterial(id, cfg) {
   m.uniforms.uAO.value = cfg.ao;
   m.uniforms.uCav.value = cfg.cav;
   m.uniforms.uDet.value = cfg.det;
+  m.uniforms.uSeed.value = seed;
   return m;
 }
 
@@ -735,14 +974,15 @@ function maxAniso() {
 
 /** Flat 1x1 stand-in so a missing renderer degrades instead of throwing. */
 function fallbackSet() {
-  const mk = (r, g, b, srgb) => {
-    const t = new THREE.DataTexture(new Uint8Array([r, g, b, 255]), 1, 1);
+  const mk = (r, g, b, srgb, a = 255) => {
+    const t = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
     t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
     t.needsUpdate = true;
     _made.push(t);
     return t;
   };
-  const orm = mk(255, 220, 0, false);
+  // alpha 128 == flat curvature, so the fallback gets neither grime nor edge wear
+  const orm = mk(255, 220, 0, false, 128);
   return {
     map: mk(140, 138, 132, true),
     normalMap: mk(128, 128, 255, false),
@@ -770,7 +1010,7 @@ function bake(name, size) {
   _renderer.setRenderTarget(fRT);
   _renderer.render(_quadScene, _quadCam);
 
-  const cm = composeMaterial(id, cfg);
+  const cm = composeMaterial(id, cfg, seed);
   cm.uniforms.uFields.value = fRT.texture;
   cm.uniforms.uTexel.value.set(1 / size, 1 / size);
   cm.uniforms.uBump.value = cfg.bump * (size / 512);
