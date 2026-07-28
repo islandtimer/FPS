@@ -141,6 +141,22 @@ window.__game = {
     benchState.halted = false;
     benchState.raf = requestAnimationFrame(frame);
   },
+  /**
+   * Fire the pose's pre-capture hook (transient effects that only last a frame or
+   * two — muzzle flash, impact spark) and render just enough frames for them to be
+   * on screen, without letting them decay away again.
+   */
+  preCapture(name, frames = 2, dt = 1 / 60) {
+    const s = CAMERA_SHOTS[name];
+    if (!s?.preCapture) return false;
+    s.preCapture({ enemies, director, level, viewmodel, player, THREE });
+    for (let i = 0; i < frames; i++) {
+      step(dt);
+      pipeline.render(scene, camera, dt);
+    }
+    return true;
+  },
+
   /** Advance exactly n rendered frames at a fixed dt, then halt. */
   settle(n = 40, dt = 1 / 60) {
     this.halt();

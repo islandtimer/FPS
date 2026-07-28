@@ -5,8 +5,11 @@ export const meta = {
 }
 
 // args: { items: [{module, title, task, why, budgetCost}], round: number }
-const A = args || {}
+// Tolerate args arriving as a JSON string — a silently empty ITEMS list spawns zero
+// agents and reports success, which is the worst possible failure mode here.
+const A = (typeof args === 'string' ? JSON.parse(args) : args) || {}
 const ITEMS = A.items || []
+if (!ITEMS.length) throw new Error('build workflow received no work items — refusing to no-op')
 
 const OWNS = {
   render: ['src/engine/renderer.js'],

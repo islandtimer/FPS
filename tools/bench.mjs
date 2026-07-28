@@ -206,6 +206,9 @@ async function main() {
       // history, eye adaptation) converges, then stop rendering entirely — the
       // capture below then reads a static surface instead of racing the compositor.
       g.settle(48, 1 / 60);
+      // Transient effects (muzzle flash, sparks) live for a frame or two, so they
+      // are triggered last — after the scene has settled, immediately before capture.
+      g.preCapture(n);
     }, name);
     const file = join(outDir, `${name}.png`);
     let captured = false;

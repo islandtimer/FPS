@@ -35,6 +35,12 @@ export const CAMERA_SHOTS = {
       for (let i = 0; i < 5; i++) enemies.spawn(level.spawnPoints[i % level.spawnPoints.length]);
       viewmodel.triggerDown(true);
     },
+    // A muzzle flash lasts one or two frames; a 48-frame settle would almost never
+    // land on one. This runs immediately before capture so the judged frame is
+    // guaranteed to contain the shot, not the gap between shots.
+    preCapture({ viewmodel }) {
+      viewmodel.forceShot?.();
+    },
   },
   material_detail: {
     pos: [12.5, 0, 1.4], yaw: -1.4, pitch: -0.15,
