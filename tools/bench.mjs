@@ -85,9 +85,13 @@ async function main() {
   const server = await serve(DIST);
   const browser = await chromium.launch({
     executablePath: CHROME,
+    // No --disable-frame-rate-limit / --disable-gpu-vsync. They let the renderer
+    // produce frames as fast as it can, which starves the compositor and makes
+    // captureScreenshot hang indefinitely at 1080p. They also buy nothing: software
+    // rasterisation runs at single-digit fps, nowhere near the 60fps vsync cap, so
+    // the uncapped-fps measurement is identical either way.
     args: ['--no-sandbox', '--enable-unsafe-swiftshader', '--use-gl=angle',
-           '--use-angle=swiftshader', '--disable-frame-rate-limit',
-           '--disable-gpu-vsync', '--js-flags=--expose-gc'],
+           '--use-angle=swiftshader', '--js-flags=--expose-gc'],
   });
 
   const errors = [];
